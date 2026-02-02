@@ -40,6 +40,10 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
+/* WHPG PATCH Starts */
+#include "cdb/cdbvars.h"
+/* WHPG PATCH Ends */
+
 PG_MODULE_MAGIC;
 
 void _PG_init(void);
@@ -576,6 +580,7 @@ log_audit_event(AuditEventStackItem *stackItem)
                             stackItem->auditEvent.commandText = commandStr;
                         }
                     }
+                /* Fall through */
 
                 /* Classify role statements */
                 case T_GrantStmt:
@@ -1887,6 +1892,14 @@ _PG_init(void)
 
     if (inited)
         return;
+
+/* WHPG PATCH Starts */
+    /* In Greenplum, only run on the query dispatcher (coordinator) */
+    if (!IS_QUERY_DISPATCHER())
+    {
+        return;
+    }
+/* WHPG PATCH Ends */
 
     /* Must be loaded with shared_preload_libraries */
     if (!process_shared_preload_libraries_in_progress)

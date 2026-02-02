@@ -1,0 +1,13 @@
+-- start_matchignore
+# This pattern is extracted from warehouse-pg/src/test/regress/init_file
+m/^(?:HINT|NOTICE):\s+.+\'DISTRIBUTED BY\' clause.*/
+m/^NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause */
+# WHPG specific warning
+m/^WARNING:  creating a table with no columns.*/
+-- end_matchignore
+
+-- start_matchsubs
+# Replace the changing OID in gp_acquire_sample_rows
+m/gp_acquire_sample_rows\(\d+,/
+s/gp_acquire_sample_rows\(\d+,/gp_acquire_sample_rows(OID,/
+-- end_matchsubs
