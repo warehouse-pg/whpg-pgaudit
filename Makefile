@@ -1,7 +1,7 @@
 # contrib/pg_audit/Makefile
 
 MODULE_big = pgaudit
-OBJS = pgaudit.o $(WIN32RES)
+OBJS = pgaudit.o pgaudit_orca.o $(WIN32RES)
 
 EXTENSION = pgaudit
 DATA = pgaudit--1.4.3.sql pgaudit--1.4--1.4.1.sql pgaudit--1.4.1--1.4.2.sql pgaudit--1.4.2--1.4.3.sql
