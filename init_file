@@ -7,3 +7,18 @@ m/^WARNING:  creating a table with no columns.*/
 # Resource queue notice on CREATE ROLE
 m/^NOTICE:  resource queue required.*/
 -- end_matchignore
+
+-- start_matchsubs
+# Replace the changing OID in gp_acquire_sample_rows
+m/gp_acquire_sample_rows\(\d+,/
+s/gp_acquire_sample_rows\(\d+,/gp_acquire_sample_rows(OID,/
+
+# Normalize EXPLAIN cost/rows/width differences between ORCA and planner
+m/Result\s+\(cost=[\d.]+\.\.[\d.]+ rows=\d+ width=\d+\)/
+s/Result\s+\(cost=[\d.]+\.\.[\d.]+ rows=\d+ width=\d+\)/Result  (cost=0.00..0.00 rows=1 width=1)/
+-- end_matchsubs
+
+-- start_matchignore
+# Ignore ORCA optimizer line in EXPLAIN output
+m/^\s*Optimizer: GPORCA/
+-- end_matchignore
