@@ -42,6 +42,7 @@
 
 /* WHPG PATCH Starts */
 #include "cdb/cdbvars.h"
+#include "pgaudit_orca.h"
 /* WHPG PATCH Ends */
 
 PG_MODULE_MAGIC;
@@ -1354,6 +1355,34 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
 {
     Oid auditOid;
 
+/* WHPG PATCH Starts */
+    /*
+     * ORCA compatibility: capture rtable during planning, use cached during execution.
+     * orca_resolve_rtable() handles both cases:
+     * - During planning: captures rangeTabls, returns NULL
+     * - During execution: returns cached rtable if found
+     */
+    {
+        List *cached_rtable = orca_resolve_rtable(rangeTabls);
+        if (cached_rtable != NULL)
+            rangeTabls = cached_rtable;
+    }
+
+    /*
+     * Skip logging if we're in ORCA planner context. ORCA calls ExecCheckRTPerms
+     * during planning, but we only want to log during actual execution.
+     * auditEventStack is unlikely to be NULL after orca_in_planner check, but
+     * check it anyway to be safe.
+     */
+    if (orca_in_planner() || !auditEventStack)
+    {
+        if (next_ExecutorCheckPerms_hook &&
+            !(*next_ExecutorCheckPerms_hook) (rangeTabls, abort))
+            return false;
+        return true;
+    }
+/* WHPG PATCH Ends */
+
     /* Get the audit oid if the role exists */
     auditOid = get_role_oid(auditRole, true);
 
@@ -1899,6 +1928,8 @@ _PG_init(void)
     {
         return;
     }
+    /* Initialize ORCA compatibility layer */
+    orca_init();
 /* WHPG PATCH Ends */
 
     /* Must be loaded with shared_preload_libraries */
