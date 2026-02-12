@@ -16,6 +16,9 @@
 #include "catalog/catalog.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
 #include "catalog/pg_proc.h"
@@ -38,6 +41,7 @@
 
 /* WHPG PATCH Starts */
 #include "cdb/cdbvars.h"
+#include "pgaudit_ddl_obj.h"
 /* WHPG PATCH Ends */
 
 PG_MODULE_MAGIC;
@@ -246,7 +250,22 @@ typedef struct
     bool logged;                /* Track if we have logged this event, used
                                    post-ProcessUtility to make sure we log */
     bool statementLogged;       /* Track if we have logged the statement */
+
+/* WHPG PATCH Starts */
+    /* Linked list of DDL objects captured from object_access_hook */
+    struct AuditDDLObject *ddlObjects;
+/* WHPG PATCH Ends */
 } AuditEvent;
+
+/* WHPG PATCH Starts */
+typedef struct AuditDDLObject
+{
+    Oid  classId;
+    Oid  objectId;
+    int  subId;
+    struct AuditDDLObject *next;
+} AuditDDLObject;
+/* WHPG PATCH Ends */
 
 /*
  * A simple FIFO queue to keep track of the current stack of audit events.
@@ -513,6 +532,47 @@ log_audit_event(AuditEventStackItem *stackItem)
             className = CLASS_DDL;
             class = LOG_DDL;
 
+/* WHPG PATCH Starts */
+            /*
+             * For WHPG6, resolve object type and name from OIDs captured by
+             * the object_access_hook, since pg_event_trigger_ddl_commands()
+             * doesn't exist in PG9.4.  Resolution is deferred to here
+             * (after ProcessUtility completes) so the catalog is consistent.
+             */
+            if (stackItem->auditEvent.ddlObjects != NULL)
+            {
+                AuditDDLObject *obj = stackItem->auditEvent.ddlObjects;
+
+                PG_TRY();
+                {
+                    if (stackItem->auditEvent.objectType == NULL)
+                    {
+                        const char *type = pgaudit_ddl_resolve_object_type(
+                            obj->classId, obj->objectId, obj->subId);
+                        stackItem->auditEvent.objectType =
+                            type ? pstrdup(type) : "";
+                    }
+
+                    if (stackItem->auditEvent.objectName == NULL)
+                    {
+                        const char *name = pgaudit_ddl_resolve_object_name(
+                            obj->classId, obj->objectId, obj->subId);
+                        stackItem->auditEvent.objectName =
+                            name ? pstrdup(name) : "";
+                    }
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                    if (stackItem->auditEvent.objectType == NULL)
+                        stackItem->auditEvent.objectType = "";
+                    if (stackItem->auditEvent.objectName == NULL)
+                        stackItem->auditEvent.objectName = "";
+                }
+                PG_END_TRY();
+            }
+/* WHPG PATCH Ends */
+
             /* Identify role statements */
             switch (stackItem->auditEvent.commandTag)
             {
@@ -563,7 +623,6 @@ log_audit_event(AuditEventStackItem *stackItem)
                             stackItem->auditEvent.commandText = commandStr;
                         }
                     }
-                /* Fall through */
 
                 /* Classify role statements */
                 case T_GrantStmt:
@@ -971,6 +1030,12 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     if (internalStatement)
         return;
 
+/* WHPG PATCH Starts */
+    /* Do not log if auditEventStack is not initialized */
+    if (auditEventStack == NULL)
+        return;
+/* WHPG PATCH Ends */
+
     foreach(lr, rangeTabls)
     {
         Oid relOid;
@@ -1232,6 +1297,9 @@ static ExecutorCheckPerms_hook_type next_ExecutorCheckPerms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static object_access_hook_type next_object_access_hook = NULL;
 static ExecutorStart_hook_type next_ExecutorStart_hook = NULL;
+/* WHPG PATCH Starts */
+static grant_hook_type next_grant_hook = NULL;
+/* WHPG PATCH Ends */
 
 /*
  * Hook ExecutorStart to get the query text and basic command type for queries
@@ -1387,6 +1455,56 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
         stackItem->auditEvent.commandText = queryString;
 
         /*
+         * For GRANT/REVOKE, extract the object type from the parse tree.
+         * pg_event_trigger_ddl_commands() doesn't exist in WHPG6, so we
+         * get this directly from the GrantStmt node.
+         */
+        if (stackItem->auditEvent.commandTag == T_GrantStmt)
+        {
+            GrantStmt *grant = (GrantStmt *) parsetree;
+            const char *type = NULL;
+
+            switch (grant->objtype)
+            {
+                case ACL_OBJECT_RELATION:
+                    type = "TABLE";
+                    break;
+                case ACL_OBJECT_SEQUENCE:
+                    type = "SEQUENCE";
+                    break;
+                case ACL_OBJECT_DATABASE:
+                    type = "DATABASE";
+                    break;
+                case ACL_OBJECT_FUNCTION:
+                    type = "FUNCTION";
+                    break;
+                case ACL_OBJECT_LANGUAGE:
+                    type = "LANGUAGE";
+                    break;
+                case ACL_OBJECT_NAMESPACE:
+                    type = "SCHEMA";
+                    break;
+                case ACL_OBJECT_TABLESPACE:
+                    type = "TABLESPACE";
+                    break;
+                case ACL_OBJECT_FDW:
+                    type = "FOREIGN DATA WRAPPER";
+                    break;
+                case ACL_OBJECT_FOREIGN_SERVER:
+                    type = "FOREIGN SERVER";
+                    break;
+                case ACL_OBJECT_TYPE:
+                    type = "TYPE";
+                    break;
+                default:
+                    break;
+            }
+
+            if (type != NULL)
+                stackItem->auditEvent.objectType = pstrdup(type);
+        }
+
+        /*
          * If this is a DO block log it before calling the next ProcessUtility
          * hook.
          */
@@ -1437,12 +1555,47 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
          */
         if (auditLogBitmap != 0 && !stackItem->auditEvent.logged)
             log_audit_event(stackItem);
+
+        /*
+         * For CREATE SCHEMA with sub-objects, emit additional audit
+         * events for each sub-object beyond the first (the schema itself).
+         */
+        if (stackItem->auditEvent.ddlObjects != NULL &&
+            stackItem->auditEvent.ddlObjects->next != NULL)
+        {
+            AuditDDLObject *obj = stackItem->auditEvent.ddlObjects->next;
+
+            while (obj != NULL)
+            {
+                PG_TRY();
+                {
+                    const char *type = pgaudit_ddl_resolve_object_type(
+                        obj->classId, obj->objectId, obj->subId);
+                    const char *name = pgaudit_ddl_resolve_object_name(
+                        obj->classId, obj->objectId, obj->subId);
+
+                    stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
+                    stackItem->auditEvent.objectName = name ? pstrdup(name) : "";
+                    stackItem->auditEvent.command =
+                        psprintf("CREATE %s", type ? type : "UNKNOWN");
+                    stackItem->auditEvent.logged = false;
+                    log_audit_event(stackItem);
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                }
+                PG_END_TRY();
+
+                obj = obj->next;
+            }
+        }
     }
 }
 
 /*
  * Hook object_access_hook to provide fully-qualified object names for function
- * calls.
+ * calls and DDL object info.
  */
 static void
 pgaudit_object_access_hook(ObjectAccessType access,
@@ -1455,9 +1608,213 @@ pgaudit_object_access_hook(ObjectAccessType access,
         auditEventStack && !IsAbortedTransactionBlockState())
         log_function_execute(objectId);
 
+/* WHPG PATCH Starts */
+    /*
+     * Capture object info for DDL auditing.
+     * This replaces pg_event_trigger_ddl_commands() which doesn't exist in PG9.4.
+     * Only store OIDs here - resolution is deferred to log_audit_event time.
+     */
+    if ((access == OAT_POST_CREATE || access == OAT_POST_ALTER) &&
+        (auditLogBitmap & (LOG_DDL | LOG_ROLE)) &&
+        auditEventStack && !IsAbortedTransactionBlockState())
+    {
+        bool is_internal = false;
+
+        if (access == OAT_POST_CREATE)
+        {
+            ObjectAccessPostCreate *pc_arg = (ObjectAccessPostCreate *) arg;
+            is_internal = pc_arg ? pc_arg->is_internal : false;
+        }
+        else
+        {
+            ObjectAccessPostAlter *pa_arg = (ObjectAccessPostAlter *) arg;
+            is_internal = pa_arg ? pa_arg->is_internal : false;
+        }
+
+        /*
+         * For CREATE TABLE AS, the executor pushes a SELECT item on
+         * top of the DDL item.  Skip it to reach the parent DDL.
+         */
+        AuditEventStackItem *target = auditEventStack;
+
+        if (target->auditEvent.commandTag == T_SelectStmt &&
+            target->next != NULL &&
+            target->next->auditEvent.commandTag == T_CreateTableAsStmt)
+        {
+            target = target->next;
+        }
+
+        /*
+         * Skip role statements - pgaudit does not report object
+         * info for CREATE/ALTER ROLE.
+         */
+        if (target->auditEvent.commandTag == T_CreateRoleStmt ||
+            target->auditEvent.commandTag == T_AlterRoleStmt ||
+            target->auditEvent.commandTag == T_AlterRoleSetStmt)
+        {
+            /* do nothing */
+        }
+        /*
+         * Skip global objects (DATABASE, TABLESPACE) whose catalog entries
+         * may not be visible due to special transaction handling.
+         */
+        else if (!is_internal &&
+            classId != DatabaseRelationId &&
+            classId != TableSpaceRelationId)
+        {
+            AuditDDLObject *newObj;
+            AuditDDLObject *existing = target->auditEvent.ddlObjects;
+            MemoryContext oldContext;
+
+            /*
+             * Allocate in the stack item's memory context so the object
+             * survives until log_audit_event is called.
+             */
+            oldContext = MemoryContextSwitchTo(target->contextAudit);
+
+            /*
+             * For CREATE SCHEMA, always append - we want to log each
+             * sub-object (tables, views, etc.) as a separate audit event.
+             */
+            if (target->auditEvent.commandTag == T_CreateSchemaStmt &&
+                !is_internal &&
+                classId != TypeRelationId)
+            {
+                newObj = palloc0(sizeof(AuditDDLObject));
+                newObj->classId = classId;
+                newObj->objectId = objectId;
+                newObj->subId = subId;
+
+                /* Append to end of list */
+                if (existing == NULL)
+                    target->auditEvent.ddlObjects = newObj;
+                else
+                {
+                    while (existing->next != NULL)
+                        existing = existing->next;
+                    existing->next = newObj;
+                }
+            }
+            /*
+             * For other commands, store only the first object, except
+             * prefer a Relation over a Type (composite type case).
+             */
+            else if (existing == NULL ||
+                     (classId == RelationRelationId &&
+                      existing->classId == TypeRelationId))
+            {
+                if (existing == NULL)
+                {
+                    existing = palloc0(sizeof(AuditDDLObject));
+                    target->auditEvent.ddlObjects = existing;
+                }
+                existing->classId = classId;
+                existing->objectId = objectId;
+                existing->subId = subId;
+            }
+
+            MemoryContextSwitchTo(oldContext);
+        }
+    }
+/* WHPG PATCH Ends */
+
     if (next_object_access_hook)
         (*next_object_access_hook) (access, classId, objectId, subId, arg);
 }
+
+/* WHPG PATCH Starts */
+/*
+ * Hook grant_hook to capture GRANT/REVOKE inside CREATE SCHEMA.
+ *
+ * Standalone GRANT is handled in the ProcessUtility hook.  But when GRANT
+ * appears as a sub-statement of CREATE SCHEMA, it is executed internally
+ * by ExecuteGrantStmt without a separate ProcessUtility call, so the only
+ * way to capture it is through the grant_hook.
+ */
+static void
+pgaudit_grant_hook(GrantObjectType objType)
+{
+    if (next_grant_hook)
+        (*next_grant_hook)(objType);
+
+    if (!auditEventStack || IsAbortedTransactionBlockState())
+        return;
+
+    /* Only handle GRANT inside CREATE SCHEMA; standalone is handled elsewhere */
+    if (auditEventStack->auditEvent.commandTag != T_CreateSchemaStmt)
+        return;
+
+    if (!(auditLogBitmap & LOG_ROLE))
+        return;
+
+    {
+        AuditEventStackItem *stackItem = auditEventStack;
+        const char *type = NULL;
+
+        switch (objType)
+        {
+            case ACL_OBJECT_RELATION:
+                type = "TABLE";
+                break;
+            case ACL_OBJECT_SEQUENCE:
+                type = "SEQUENCE";
+                break;
+            case ACL_OBJECT_DATABASE:
+                type = "DATABASE";
+                break;
+            case ACL_OBJECT_FUNCTION:
+                type = "FUNCTION";
+                break;
+            case ACL_OBJECT_LANGUAGE:
+                type = "LANGUAGE";
+                break;
+            case ACL_OBJECT_NAMESPACE:
+                type = "SCHEMA";
+                break;
+            case ACL_OBJECT_TABLESPACE:
+                type = "TABLESPACE";
+                break;
+            case ACL_OBJECT_FDW:
+                type = "FOREIGN DATA WRAPPER";
+                break;
+            case ACL_OBJECT_FOREIGN_SERVER:
+                type = "FOREIGN SERVER";
+                break;
+            case ACL_OBJECT_TYPE:
+                type = "TYPE";
+                break;
+            default:
+                break;
+        }
+
+        /*
+         * Temporarily override the stack item fields to emit a GRANT
+         * audit event, then restore the originals.
+         */
+        {
+            NodeTag savedTag = stackItem->auditEvent.commandTag;
+            const char *savedCommand = stackItem->auditEvent.command;
+            const char *savedType = stackItem->auditEvent.objectType;
+            char *savedName = stackItem->auditEvent.objectName;
+            bool savedLogged = stackItem->auditEvent.logged;
+
+            stackItem->auditEvent.commandTag = T_GrantStmt;
+            stackItem->auditEvent.command = "GRANT";
+            stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
+            stackItem->auditEvent.objectName = "";
+            stackItem->auditEvent.logged = false;
+
+            log_audit_event(stackItem);
+
+            stackItem->auditEvent.commandTag = savedTag;
+            stackItem->auditEvent.command = savedCommand;
+            stackItem->auditEvent.objectType = savedType;
+            stackItem->auditEvent.objectName = savedName;
+            stackItem->auditEvent.logged = savedLogged;
+        }
+    }
+}
+/* WHPG PATCH Ends */
 
 /*
  * Event trigger functions
@@ -2003,6 +2360,11 @@ _PG_init(void)
 
     next_object_access_hook = object_access_hook;
     object_access_hook = pgaudit_object_access_hook;
+
+/* WHPG PATCH Starts */
+    next_grant_hook = grant_hook;
+    grant_hook = pgaudit_grant_hook;
+/* WHPG PATCH Ends */
 
     /* Log that the extension has completed initialization */
 #ifndef EXEC_BACKEND
