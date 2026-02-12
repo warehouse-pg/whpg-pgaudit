@@ -1557,8 +1557,8 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
             log_audit_event(stackItem);
 
         /*
-         * For CREATE SCHEMA with sub-objects, emit additional audit
-         * events for each sub-object beyond the first (the schema itself).
+         * For commands with multiple sub-objects (CREATE SCHEMA, ALTER TABLE),
+         * emit additional audit events for each sub-object beyond the first.
          */
         if (stackItem->auditEvent.ddlObjects != NULL &&
             stackItem->auditEvent.ddlObjects->next != NULL)
@@ -1576,8 +1576,12 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
 
                     stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
                     stackItem->auditEvent.objectName = name ? pstrdup(name) : "";
-                    stackItem->auditEvent.command =
-                        psprintf("CREATE %s", type ? type : "UNKNOWN");
+
+                    /* Only override command for CREATE SCHEMA sub-objects */
+                    if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt)
+                        stackItem->auditEvent.command =
+                            psprintf("CREATE %s", type ? type : "UNKNOWN");
+
                     stackItem->auditEvent.logged = false;
                     log_audit_event(stackItem);
                 }
@@ -1588,6 +1592,44 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
                 PG_END_TRY();
 
                 obj = obj->next;
+            }
+        }
+
+        /*
+         * For ALTER TABLE sub-commands that only fire OAT_DROP (e.g.
+         * DROP COLUMN), ddlObjects is empty because our hook doesn't
+         * capture OAT_DROP.  The column event is handled by
+         * pgaudit_sql_drop, but the table-level event is missing.
+         * Emit it here by resolving the table OID from the parse tree.
+         */
+        if (stackItem->auditEvent.commandTag == T_AlterTableStmt &&
+            stackItem->auditEvent.ddlObjects == NULL &&
+            stackItem->auditEvent.logged)
+        {
+            AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+            Oid relOid = RangeVarGetRelid(atstmt->relation, NoLock, true);
+
+            if (OidIsValid(relOid))
+            {
+                PG_TRY();
+                {
+                    const char *type = pgaudit_ddl_resolve_object_type(
+                        RelationRelationId, relOid, 0);
+                    const char *name = pgaudit_ddl_resolve_object_name(
+                        RelationRelationId, relOid, 0);
+
+                    stackItem->auditEvent.objectType =
+                        type ? pstrdup(type) : "";
+                    stackItem->auditEvent.objectName =
+                        name ? pstrdup(name) : "";
+                    stackItem->auditEvent.logged = false;
+                    log_audit_event(stackItem);
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                }
+                PG_END_TRY();
             }
         }
     }
@@ -1675,8 +1717,11 @@ pgaudit_object_access_hook(ObjectAccessType access,
             /*
              * For CREATE SCHEMA, always append - we want to log each
              * sub-object (tables, views, etc.) as a separate audit event.
+             * For ALTER TABLE, append all sub-events (e.g. DROP COLUMN
+             * fires for both the column and the table).
              */
-            if (target->auditEvent.commandTag == T_CreateSchemaStmt &&
+            if ((target->auditEvent.commandTag == T_CreateSchemaStmt ||
+                 target->auditEvent.commandTag == T_AlterTableStmt) &&
                 !is_internal &&
                 classId != TypeRelationId)
             {
