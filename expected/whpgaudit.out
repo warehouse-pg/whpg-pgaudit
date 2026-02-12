@@ -1,0 +1,90 @@
+\set VERBOSITY terse
+-- Create pgaudit extension
+CREATE EXTENSION IF NOT EXISTS pgaudit;
+--
+-- WHPG-specific audit tests
+--
+SET pgaudit.log = 'DDL, READ';
+SET pgaudit.log_client = ON;
+SET pgaudit.log_level = 'notice';
+-- Setup base table
+CREATE TABLE src (id int, data text);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,1,1,DDL,CREATE TABLE,TABLE,public.src,"CREATE TABLE src (id int, data text);",<not logged>
+INSERT INTO src VALUES (1, 'one'), (2, 'two');
+-- SELECT INTO (rewritten to CTAS internally, is_select_into=true)
+SELECT * INTO dst_select_into FROM src;
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,2,1,READ,SELECT,,,SELECT * INTO dst_select_into FROM src;,<not logged>
+NOTICE:  AUDIT: SESSION,2,2,DDL,SELECT INTO,TABLE,public.dst_select_into,SELECT * INTO dst_select_into FROM src;,<not logged>
+-- CREATE MATERIALIZED VIEW
+CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,3,1,READ,SELECT,,,CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;,<not logged>
+NOTICE:  AUDIT: SESSION,3,2,DDL,CREATE MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;,<not logged>
+-- REFRESH MATERIALIZED VIEW
+REFRESH MATERIALIZED VIEW mv_src;
+NOTICE:  AUDIT: SESSION,4,1,READ,SELECT,,,REFRESH MATERIALIZED VIEW mv_src;,<not logged>
+NOTICE:  AUDIT: SESSION,4,2,DDL,REFRESH MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,REFRESH MATERIALIZED VIEW mv_src;,<not logged>
+-- CREATE TYPE (composite)
+CREATE TYPE comp_type AS (x int, y text);
+NOTICE:  AUDIT: SESSION,5,1,DDL,CREATE TYPE,TYPE,public.comp_type,"CREATE TYPE comp_type AS (x int, y text);",<not logged>
+DROP TYPE comp_type;
+NOTICE:  AUDIT: SESSION,6,1,DDL,DROP TYPE,COMPOSITE TYPE,public.comp_type,DROP TYPE comp_type;,<not logged>
+-- CREATE TYPE (enum)
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+NOTICE:  AUDIT: SESSION,7,1,DDL,CREATE TYPE,TYPE,public.mood,"CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');",<not logged>
+DROP TYPE mood;
+NOTICE:  AUDIT: SESSION,8,1,DDL,DROP TYPE,,,DROP TYPE mood;,<not logged>
+-- CREATE RULE (tests pg_rewrite resolution)
+CREATE TABLE rule_base (id int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,9,1,DDL,CREATE TABLE,TABLE,public.rule_base,CREATE TABLE rule_base (id int);,<not logged>
+CREATE VIEW rule_view AS SELECT * FROM rule_base;
+NOTICE:  AUDIT: SESSION,10,1,DDL,CREATE VIEW,VIEW,public.rule_view,CREATE VIEW rule_view AS SELECT * FROM rule_base;,<not logged>
+CREATE RULE rule_ins AS ON INSERT TO rule_view DO INSTEAD INSERT INTO rule_base VALUES (NEW.id);
+NOTICE:  AUDIT: SESSION,11,1,DDL,CREATE RULE,RULE,rule_ins on public.rule_view,CREATE RULE rule_ins AS ON INSERT TO rule_view DO INSTEAD INSERT INTO rule_base VALUES (NEW.id);,<not logged>
+DROP RULE rule_ins ON rule_view;
+NOTICE:  AUDIT: SESSION,12,1,DDL,DROP RULE,,,DROP RULE rule_ins ON rule_view;,<not logged>
+DROP VIEW rule_view;
+NOTICE:  AUDIT: SESSION,13,1,DDL,DROP VIEW,VIEW,public.rule_view,DROP VIEW rule_view;,<not logged>
+DROP TABLE rule_base;
+NOTICE:  AUDIT: SESSION,14,1,DDL,DROP TABLE,TABLE,public.rule_base,DROP TABLE rule_base;,<not logged>
+-- CREATE CAST (tests pg_cast resolution)
+CREATE TYPE casttesttype;
+NOTICE:  AUDIT: SESSION,15,1,DDL,CREATE TYPE,TYPE,public.casttesttype,CREATE TYPE casttesttype;,<not logged>
+CREATE FUNCTION casttesttype_in(cstring) RETURNS casttesttype AS 'textin' LANGUAGE internal STRICT;
+NOTICE:  return type casttesttype is only a shell
+NOTICE:  AUDIT: SESSION,16,1,DDL,CREATE FUNCTION,FUNCTION,public.casttesttype_in(cstring),CREATE FUNCTION casttesttype_in(cstring) RETURNS casttesttype AS 'textin' LANGUAGE internal STRICT;,<not logged>
+CREATE FUNCTION casttesttype_out(casttesttype) RETURNS cstring AS 'textout' LANGUAGE internal STRICT;
+NOTICE:  argument type casttesttype is only a shell
+NOTICE:  AUDIT: SESSION,17,1,DDL,CREATE FUNCTION,FUNCTION,public.casttesttype_out(casttesttype),CREATE FUNCTION casttesttype_out(casttesttype) RETURNS cstring AS 'textout' LANGUAGE internal STRICT;,<not logged>
+CREATE TYPE casttesttype (internallength = variable, input = casttesttype_in, output = casttesttype_out);
+NOTICE:  AUDIT: SESSION,18,1,DDL,CREATE TYPE,TYPE,public.casttesttype,"CREATE TYPE casttesttype (internallength = variable, input = casttesttype_in, output = casttesttype_out);",<not logged>
+CREATE CAST (text AS casttesttype) WITHOUT FUNCTION;
+NOTICE:  AUDIT: SESSION,19,1,DDL,CREATE CAST,CAST,(text AS casttesttype),CREATE CAST (text AS casttesttype) WITHOUT FUNCTION;,<not logged>
+DROP CAST (text AS casttesttype);
+NOTICE:  AUDIT: SESSION,20,1,DDL,DROP CAST,,,DROP CAST (text AS casttesttype);,<not logged>
+DROP TYPE casttesttype CASCADE;
+NOTICE:  drop cascades to 2 other objects
+NOTICE:  AUDIT: SESSION,21,1,DDL,DROP TYPE,FUNCTION,public.casttesttype_in(pg_catalog.cstring),DROP TYPE casttesttype CASCADE;,<not logged>
+NOTICE:  AUDIT: SESSION,21,1,DDL,DROP TYPE,FUNCTION,public.casttesttype_out(public.casttesttype),DROP TYPE casttesttype CASCADE;,<not logged>
+-- ALTER TABLE/VIEW SET DEFAULT (tests pg_attrdef resolution)
+-- The object_access_hook passes objectId=relid, subId=attnum for pg_attrdef
+CREATE TABLE attrdef_test (id int, name text);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,22,1,DDL,CREATE TABLE,TABLE,public.attrdef_test,"CREATE TABLE attrdef_test (id int, name text);",<not logged>
+ALTER TABLE attrdef_test ALTER COLUMN name SET DEFAULT 'test default';
+NOTICE:  AUDIT: SESSION,23,1,DDL,ALTER TABLE,,,ALTER TABLE attrdef_test ALTER COLUMN name SET DEFAULT 'test default';,<not logged>
+DROP TABLE attrdef_test;
+NOTICE:  AUDIT: SESSION,24,1,DDL,DROP TABLE,TABLE,public.attrdef_test,DROP TABLE attrdef_test;,<not logged>
+-- Cleanup
+DROP MATERIALIZED VIEW mv_src;
+NOTICE:  AUDIT: SESSION,25,1,DDL,DROP MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,DROP MATERIALIZED VIEW mv_src;,<not logged>
+DROP TABLE dst_select_into;
+NOTICE:  AUDIT: SESSION,26,1,DDL,DROP TABLE,TABLE,public.dst_select_into,DROP TABLE dst_select_into;,<not logged>
+DROP TABLE src;
+NOTICE:  AUDIT: SESSION,27,1,DDL,DROP TABLE,TABLE,public.src,DROP TABLE src;,<not logged>
+RESET pgaudit.log;
+RESET pgaudit.log_client;
+RESET pgaudit.log_level;

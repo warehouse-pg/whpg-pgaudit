@@ -4,4 +4,6 @@ m/^(?:HINT|NOTICE):\s+.+\'DISTRIBUTED BY\' clause.*/
 m/^NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause */
 # WHPG specific warning
 m/^WARNING:  creating a table with no columns.*/
+# Resource queue notice on CREATE ROLE
+m/^NOTICE:  resource queue required.*/
 -- end_matchignore

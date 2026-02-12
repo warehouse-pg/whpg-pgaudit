@@ -37,7 +37,12 @@
 #include "utils/timestamp.h"
 
 /* WHPG PATCH Starts */
+#include "utils/elog.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_tablespace.h"
 #include "cdb/cdbvars.h"
+#include "pgaudit_ddl_obj.h"
 /* WHPG PATCH Ends */
 
 PG_MODULE_MAGIC;
@@ -246,7 +251,22 @@ typedef struct
     bool logged;                /* Track if we have logged this event, used
                                    post-ProcessUtility to make sure we log */
     bool statementLogged;       /* Track if we have logged the statement */
+
+/* WHPG PATCH Starts */
+    /* Linked list of DDL objects captured from object_access_hook */
+    struct AuditDDLObject *ddlObjects;
+/* WHPG PATCH Ends */
 } AuditEvent;
+
+/* WHPG PATCH Starts */
+typedef struct AuditDDLObject
+{
+    Oid  classId;
+    Oid  objectId;
+    int  subId;
+    struct AuditDDLObject *next;
+} AuditDDLObject;
+/* WHPG PATCH Ends */
 
 /*
  * A simple FIFO queue to keep track of the current stack of audit events.
@@ -262,6 +282,21 @@ typedef struct AuditEventStackItem
     MemoryContext contextAudit;
     MemoryContextCallback contextCallback;
 } AuditEventStackItem;
+
+/* WHPG PATCH Starts */
+static inline void pgaudit_ddl_object_capture(ObjectAccessType access,
+                                       Oid classId, Oid objectId, int subId,
+                                       void *arg);
+static inline void pgaudit_ddl_resolve_refresh_matview(
+                                       AuditEventStackItem *stackItem,
+                                       Node *parsetree);
+static inline void pgaudit_ddl_log_sub_objects(
+                                       AuditEventStackItem *stackItem);
+static inline void pgaudit_ddl_resolve_alter_table_fallback(
+                                       AuditEventStackItem *stackItem,
+                                       Node *parsetree);
+static void pgaudit_grant_hook(GrantObjectType objType);
+/* WHPG PATCH Ends */
 
 AuditEventStackItem *auditEventStack = NULL;
 
@@ -512,6 +547,45 @@ log_audit_event(AuditEventStackItem *stackItem)
         case LOGSTMT_DDL:
             className = CLASS_DDL;
             class = LOG_DDL;
+
+/* WHPG PATCH Starts */
+            /*
+             * For WHPG6, resolve object type and name from OIDs captured by
+             * the object_access_hook, since pg_event_trigger_ddl_commands()
+             * doesn't exist in PG9.4.  Resolution is deferred to here
+             * (after ProcessUtility completes) so the catalog is consistent.
+             */
+            if (stackItem->auditEvent.ddlObjects != NULL &&
+                (stackItem->auditEvent.objectType == NULL ||
+                 stackItem->auditEvent.objectName == NULL))
+            {
+                AuditDDLObject *obj = stackItem->auditEvent.ddlObjects;
+                const char *type = NULL;
+                const char *name = NULL;
+                MemoryContext oldContext;
+
+                oldContext = MemoryContextSwitchTo(stackItem->contextAudit);
+                PG_TRY();
+                {
+                    pgaudit_ddl_resolve_object(obj->classId, obj->objectId,
+                                               obj->subId, &type, &name);
+                    if (stackItem->auditEvent.objectType == NULL)
+                        stackItem->auditEvent.objectType = type ? type : pstrdup("");
+                    if (stackItem->auditEvent.objectName == NULL)
+                        stackItem->auditEvent.objectName = name ? (char*)name : pstrdup("");
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                    if (stackItem->auditEvent.objectType == NULL)
+                        stackItem->auditEvent.objectType = "";
+                    if (stackItem->auditEvent.objectName == NULL)
+                        stackItem->auditEvent.objectName = "";
+                }
+                PG_END_TRY();
+                MemoryContextSwitchTo(oldContext);
+            }
+/* WHPG PATCH Ends */
 
             /* Identify role statements */
             switch (stackItem->auditEvent.commandTag)
@@ -971,6 +1045,12 @@ log_select_dml(Oid auditOid, List *rangeTabls)
     if (internalStatement)
         return;
 
+/* WHPG PATCH Starts */
+    /* Do not log if auditEventStack is not initialized */
+    if (auditEventStack == NULL)
+        return;
+/* WHPG PATCH Ends */
+
     foreach(lr, rangeTabls)
     {
         Oid relOid;
@@ -1232,6 +1312,9 @@ static ExecutorCheckPerms_hook_type next_ExecutorCheckPerms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static object_access_hook_type next_object_access_hook = NULL;
 static ExecutorStart_hook_type next_ExecutorStart_hook = NULL;
+/* WHPG PATCH Starts */
+static grant_hook_type next_grant_hook = NULL;
+/* WHPG PATCH Ends */
 
 /*
  * Hook ExecutorStart to get the query text and basic command type for queries
@@ -1430,6 +1513,10 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
          */
         stack_valid(stackId);
 
+        /* WHPG PATCH Starts */
+        pgaudit_ddl_resolve_refresh_matview(stackItem, parsetree);
+        /* WHPG PATCH Ends */
+
         /*
          * Log the utility command if logging is on, the command has not
          * already been logged by another hook, and the transaction is not
@@ -1437,12 +1524,17 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
          */
         if (auditLogBitmap != 0 && !stackItem->auditEvent.logged)
             log_audit_event(stackItem);
+
+        /* WHPG PATCH Starts */
+        pgaudit_ddl_log_sub_objects(stackItem);
+        pgaudit_ddl_resolve_alter_table_fallback(stackItem, parsetree);
+        /* WHPG PATCH Ends */
     }
 }
 
 /*
  * Hook object_access_hook to provide fully-qualified object names for function
- * calls.
+ * calls and DDL object info.
  */
 static void
 pgaudit_object_access_hook(ObjectAccessType access,
@@ -1454,6 +1546,16 @@ pgaudit_object_access_hook(ObjectAccessType access,
     if (auditLogBitmap & LOG_FUNCTION && access == OAT_FUNCTION_EXECUTE &&
         auditEventStack && !IsAbortedTransactionBlockState())
         log_function_execute(objectId);
+
+/* WHPG PATCH Starts */
+    /* Capture DDL object info for audit logging */
+    if ((access == OAT_POST_CREATE || access == OAT_POST_ALTER) &&
+        (auditLogBitmap & (LOG_DDL | LOG_ROLE)) &&
+        auditEventStack && !IsAbortedTransactionBlockState())
+    {
+        pgaudit_ddl_object_capture(access, classId, objectId, subId, arg);
+    }
+/* WHPG PATCH Ends */
 
     if (next_object_access_hook)
         (*next_object_access_hook) (access, classId, objectId, subId, arg);
@@ -2004,6 +2106,11 @@ _PG_init(void)
     next_object_access_hook = object_access_hook;
     object_access_hook = pgaudit_object_access_hook;
 
+/* WHPG PATCH Starts */
+    next_grant_hook = grant_hook;
+    grant_hook = pgaudit_grant_hook;
+/* WHPG PATCH Ends */
+
     /* Log that the extension has completed initialization */
 #ifndef EXEC_BACKEND
     ereport(LOG, (errmsg("pgaudit extension initialized")));
@@ -2013,3 +2120,443 @@ _PG_init(void)
 
     inited = true;
 }
+
+/* WHPG PATCH Starts */
+/*
+ * Capture DDL object info from object_access_hook for audit logging.
+ *
+ * This replaces pg_event_trigger_ddl_commands() which doesn't exist in PG9.4.
+ * Only OIDs are stored here — resolution to type/name strings is deferred to
+ * log_audit_event time, after ProcessUtility completes and the catalog is
+ * consistent.
+ *
+ * Objects are stored in a per-stack-item linked list (ddlObjects).  For most
+ * commands only the first object is kept, but CREATE SCHEMA, ALTER TABLE, and
+ * CREATE TABLE append all sub-objects so multiple audit events can be emitted.
+ *
+ * Hook calling order for key DDL commands (from heap_create_with_catalog):
+ *
+ *   CREATE TABLE (T_CreateStmt):
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, typeOid)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, tableOid)
+ *     3. index_create     -> OAT_POST_CREATE(RelationRelationId, indexOid)
+ *        (only if PRIMARY KEY / UNIQUE constraint exists)
+ *
+ *   CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED VIEW
+ *   (T_CreateTableAsStmt, with T_SelectStmt on top of stack):
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, typeOid)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, relOid)
+ *
+ *   CREATE SCHEMA (T_CreateSchemaStmt):
+ *     Per sub-object (table, view, etc.), same sequence as above.
+ *
+ *   ALTER TABLE (T_AlterTableStmt):
+ *     ADD COLUMN:  OAT_POST_ALTER(RelationRelationId, tableOid, attnum)
+ *     RENAME:      OAT_POST_ALTER(RelationRelationId, tableOid, 0)
+ *     DROP COLUMN: OAT_DROP only (handled by pgaudit_sql_drop)
+ *
+ *   REFRESH MATERIALIZED VIEW (T_RefreshMatViewStmt):
+ *     make_new_heap creates a transient table internally:
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, is_internal=false)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, is_internal=true)
+ *     Neither is useful — we skip and resolve from the parse tree instead.
+ *
+ *   Other DDL (CREATE VIEW, CREATE INDEX, CREATE FUNCTION, etc.):
+ *     Typically fires TypeRelationId first, then RelationRelationId.
+ *     The single-object fallback stores the first and lets
+ *     RelationRelationId overwrite TypeRelationId if both fire.
+ *     For types without a backing relation (ENUM, RANGE), only
+ *     TypeRelationId fires and is kept as-is.
+ */
+static inline void
+pgaudit_ddl_object_capture(ObjectAccessType access,
+                           Oid classId, Oid objectId, int subId,
+                           void *arg)
+{
+    bool is_internal = false;
+    AuditEventStackItem *target;
+    AuditDDLObject *newObj;
+    AuditDDLObject *existing;
+    MemoryContext oldContext;
+
+    if (access == OAT_POST_CREATE)
+    {
+        ObjectAccessPostCreate *pc_arg = (ObjectAccessPostCreate *) arg;
+        is_internal = pc_arg ? pc_arg->is_internal : false;
+    }
+    else
+    {
+        ObjectAccessPostAlter *pa_arg = (ObjectAccessPostAlter *) arg;
+        is_internal = pa_arg ? pa_arg->is_internal : false;
+    }
+
+    /*
+     * Skip global objects (DATABASE, TABLESPACE) whose catalog entries
+     * may not be visible due to special transaction handling.
+     */
+    if (is_internal ||
+        classId == DatabaseRelationId ||
+        classId == TableSpaceRelationId)
+        return;
+
+    target = auditEventStack;
+
+    /*
+     * Route by command tag.  Only commands listed here (or falling
+     * through to default) will have hook-captured objects stored.
+     */
+    switch (target->auditEvent.commandTag)
+    {
+        /* CTAS / SELECT INTO / CREATE MATVIEW: walk past SELECT */
+        case T_SelectStmt:
+            if (target->next != NULL &&
+                target->next->auditEvent.commandTag == T_CreateTableAsStmt)
+                target = target->next;
+            else
+                return;
+            break;
+
+        /* Multi-object commands with explicit handling below */
+        case T_CreateStmt:
+            /*
+             * heap_create_with_catalog fires two hooks in order:
+             *   1. TypeCreate  -> OAT_POST_CREATE(TypeRelationId)
+             *   2. heap_create -> OAT_POST_CREATE(RelationRelationId)
+             *
+             * CREATE TABLE uses the multi-object append path below,
+             * which only accepts RelationRelationId.  Skip the
+             * composite type hook entirely so it is never stored.
+             */
+            if (classId == TypeRelationId)
+                return;
+            break;
+        case T_CreateSchemaStmt:
+        case T_AlterTableStmt:
+        case T_CreateTableAsStmt:
+            break;
+
+        /* Commands whose hook objects are not useful for auditing */
+        case T_CreateRoleStmt:
+        case T_AlterRoleStmt:
+        case T_AlterRoleSetStmt:
+        case T_RefreshMatViewStmt:
+            return;
+
+        /* All other DDL: single-object fallback */
+        default:
+            break;
+    }
+
+    existing = target->auditEvent.ddlObjects;
+
+    /*
+     * Allocate in the stack item's memory context so the object
+     * survives until log_audit_event is called.
+     */
+    oldContext = MemoryContextSwitchTo(target->contextAudit);
+
+    /*
+     * For CREATE SCHEMA, always append - we want to log each
+     * sub-object (tables, views, etc.) as a separate audit event.
+     * For ALTER TABLE, append all sub-events (e.g. DROP COLUMN
+     * fires for both the column and the table).
+     * For CREATE TABLE, append so we capture indexes created
+     * by PRIMARY KEY / UNIQUE constraints.
+     */
+    if ((((target->auditEvent.commandTag == T_CreateSchemaStmt ||
+           target->auditEvent.commandTag == T_AlterTableStmt) &&
+          classId != TypeRelationId) ||
+         (target->auditEvent.commandTag == T_CreateStmt &&
+          classId == RelationRelationId)))
+    {
+        newObj = palloc0(sizeof(AuditDDLObject));
+        newObj->classId = classId;
+        newObj->objectId = objectId;
+        /*
+         * For ALTER TABLE, report at table level (subId=0).
+         * Column-level events (e.g. DROP COLUMN) are handled
+         * separately by pgaudit_sql_drop.
+         */
+        newObj->subId =
+            (target->auditEvent.commandTag == T_AlterTableStmt)
+            ? 0 : subId;
+
+        /* Append to end of list */
+        if (existing == NULL)
+            target->auditEvent.ddlObjects = newObj;
+        else
+        {
+            while (existing->next != NULL)
+                existing = existing->next;
+            existing->next = newObj;
+        }
+    }
+    /*
+     * Single-object fallback for all other DDL commands (e.g.
+     * CREATE VIEW, CREATE INDEX, CREATE FUNCTION, RENAME, etc.).
+     *
+     * heap_create_with_catalog fires two hooks in order:
+     *   1. TypeCreate  -> OAT_POST_CREATE(TypeRelationId)   (composite type)
+     *   2. heap_create -> OAT_POST_CREATE(RelationRelationId) (the relation)
+     *
+     * We only want the relation, not the composite type.  Since the
+     * type hook fires first and would be stored as the first entry,
+     * we allow the later relation hook to overwrite it (the
+     * RelationRelationId-over-TypeRelationId preference below).
+     *
+     * Note: CREATE TABLE (T_CreateStmt) TypeRelationId skip is
+     * handled in the switch above, not here.
+     */
+    else if (existing == NULL ||
+             (classId == RelationRelationId &&
+              existing->classId == TypeRelationId))
+    {
+        if (existing == NULL)
+        {
+            existing = palloc0(sizeof(AuditDDLObject));
+            target->auditEvent.ddlObjects = existing;
+        }
+        existing->classId = classId;
+        existing->objectId = objectId;
+        existing->subId = subId;
+    }
+
+    MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * For REFRESH MATERIALIZED VIEW, the object_access_hook only
+ * sees the transient table's composite type, which we skip.
+ * Resolve the matview from the parse tree before logging.
+ */
+static inline void
+pgaudit_ddl_resolve_refresh_matview(AuditEventStackItem *stackItem,
+                                    Node *parsetree)
+{
+    if (stackItem->auditEvent.commandTag == T_RefreshMatViewStmt)
+    {
+        RefreshMatViewStmt *rstmt = (RefreshMatViewStmt *) parsetree;
+        Oid relOid = RangeVarGetRelid(rstmt->relation, NoLock, true);
+
+        if (OidIsValid(relOid))
+        {
+            MemoryContext oldContext;
+            const char *type = NULL;
+            const char *name = NULL;
+
+            oldContext = MemoryContextSwitchTo(stackItem->contextAudit);
+            pgaudit_ddl_resolve_object(RelationRelationId, relOid, 0,
+                                       &type, &name);
+            stackItem->auditEvent.objectType = type ? type : pstrdup("");
+            stackItem->auditEvent.objectName = name ? (char*)name : pstrdup("");
+            MemoryContextSwitchTo(oldContext);
+        }
+    }
+}
+
+/*
+ * For commands with multiple sub-objects (CREATE SCHEMA, ALTER TABLE),
+ * emit additional audit events for each sub-object beyond the first.
+ */
+static inline void
+pgaudit_ddl_log_sub_objects(AuditEventStackItem *stackItem)
+{
+    if (stackItem->auditEvent.ddlObjects != NULL &&
+        stackItem->auditEvent.ddlObjects->next != NULL)
+    {
+        /* Start from the 2nd element. The 1st has been logged in the previous
+         * log_audit_event. */
+        AuditDDLObject *obj = stackItem->auditEvent.ddlObjects->next;
+        MemoryContext oldContext;
+
+        oldContext = MemoryContextSwitchTo(stackItem->contextAudit);
+
+        while (obj != NULL)
+        {
+            AuditDDLObject *nextObj = obj->next;  /* Save before potential free */
+            PG_TRY();
+            {
+                const char *type = NULL;
+                const char *name = NULL;
+
+                pgaudit_ddl_resolve_object(obj->classId, obj->objectId,
+                                           obj->subId, &type, &name);
+                stackItem->auditEvent.objectType = type ? type : pstrdup("");
+                stackItem->auditEvent.objectName = name ? (char*)name : pstrdup("");
+
+                /* Override command for CREATE SCHEMA/TABLE sub-objects */
+                if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt ||
+                    stackItem->auditEvent.commandTag == T_CreateStmt)
+                    stackItem->auditEvent.command =
+                        psprintf("CREATE %s", type ? type : "UNKNOWN");
+
+                stackItem->auditEvent.logged = false;
+                log_audit_event(stackItem);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+
+            obj = nextObj;
+        }
+
+        MemoryContextSwitchTo(oldContext);
+    }
+}
+
+/*
+ * For ALTER TABLE sub-commands that only fire OAT_DROP (e.g.
+ * DROP COLUMN), ddlObjects is empty because our hook doesn't
+ * capture OAT_DROP.  The column event is handled by
+ * pgaudit_sql_drop, but the table-level event is missing.
+ * Emit it here by resolving the table OID from the parse tree.
+ */
+static inline void
+pgaudit_ddl_resolve_alter_table_fallback(AuditEventStackItem *stackItem,
+                                         Node *parsetree)
+{
+    if (stackItem->auditEvent.commandTag == T_AlterTableStmt &&
+        stackItem->auditEvent.ddlObjects == NULL &&
+        stackItem->auditEvent.logged)
+    {
+        AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+        Oid relOid = RangeVarGetRelid(atstmt->relation, NoLock, true);
+
+        if (OidIsValid(relOid))
+        {
+            MemoryContext oldContext;
+
+            oldContext = MemoryContextSwitchTo(stackItem->contextAudit);
+            PG_TRY();
+            {
+                const char *type = NULL;
+                const char *name = NULL;
+
+                pgaudit_ddl_resolve_object(RelationRelationId, relOid, 0,
+                                           &type, &name);
+                stackItem->auditEvent.objectType = type ? type : pstrdup("");
+                stackItem->auditEvent.objectName = name ? (char*)name : pstrdup("");
+                stackItem->auditEvent.logged = false;
+                log_audit_event(stackItem);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+            MemoryContextSwitchTo(oldContext);
+        }
+    }
+}
+
+/*
+ * Map GrantObjectType to a human-readable object type string.
+ */
+static const char *
+pgaudit_grant_type_name(GrantObjectType objType)
+{
+    switch (objType)
+    {
+        case ACL_OBJECT_RELATION:
+            return "TABLE";
+        case ACL_OBJECT_SEQUENCE:
+            return "SEQUENCE";
+        case ACL_OBJECT_DATABASE:
+            return "DATABASE";
+        case ACL_OBJECT_FUNCTION:
+            return "FUNCTION";
+        case ACL_OBJECT_LANGUAGE:
+            return "LANGUAGE";
+        case ACL_OBJECT_NAMESPACE:
+            return "SCHEMA";
+        case ACL_OBJECT_TABLESPACE:
+            return "TABLESPACE";
+        case ACL_OBJECT_FDW:
+            return "FOREIGN DATA WRAPPER";
+        case ACL_OBJECT_FOREIGN_SERVER:
+            return "FOREIGN SERVER";
+        case ACL_OBJECT_TYPE:
+            return "TYPE";
+        default:
+            return NULL;
+    }
+}
+
+/*
+ * Hook grant_hook to capture GRANT/REVOKE object type.
+ *
+ * For standalone GRANT/REVOKE, set the object type on the stack item
+ * so the post-utility log_audit_event picks it up.
+ *
+ * For GRANT inside CREATE SCHEMA, the sub-statement is executed
+ * internally by ExecuteGrantStmt without a separate ProcessUtility
+ * call, so we emit the audit event directly here.
+ */
+static void
+pgaudit_grant_hook(GrantObjectType objType)
+{
+    AuditEventStackItem *stackItem;
+    MemoryContext oldContext;
+    const char *type;
+
+    if (next_grant_hook)
+        (*next_grant_hook)(objType);
+
+    if (!auditEventStack || IsAbortedTransactionBlockState())
+        return;
+
+    stackItem = auditEventStack;
+    oldContext = MemoryContextSwitchTo(stackItem->contextAudit);
+    type = pgaudit_grant_type_name(objType);
+
+    /*
+     * Standalone GRANT/REVOKE: just resolve objectType.
+     * Logging happens in the post-utility section of ProcessUtility.
+     */
+    if (stackItem->auditEvent.commandTag == T_GrantStmt)
+    {
+        if (type != NULL)
+            stackItem->auditEvent.objectType = pstrdup(type);
+        goto cleanup;
+    }
+
+    /* For CREATE SCHEMA sub-GRANTs, emit a separate audit event */
+    if (stackItem->auditEvent.commandTag != T_CreateSchemaStmt)
+        goto cleanup;
+
+    if (!(auditLogBitmap & LOG_ROLE))
+        goto cleanup;
+
+    /*
+     * Temporarily override the stack item fields to emit a GRANT
+     * audit event, then restore the originals.
+     */
+    {
+        NodeTag savedTag = stackItem->auditEvent.commandTag;
+        const char *savedCommand = stackItem->auditEvent.command;
+        const char *savedType = stackItem->auditEvent.objectType;
+        char *savedName = stackItem->auditEvent.objectName;
+        bool savedLogged = stackItem->auditEvent.logged;
+
+        stackItem->auditEvent.commandTag = T_GrantStmt;
+        stackItem->auditEvent.command = "GRANT";
+        stackItem->auditEvent.objectType = type ? type : pstrdup("");
+        stackItem->auditEvent.objectName = "";
+        stackItem->auditEvent.logged = false;
+
+        log_audit_event(stackItem);
+
+        stackItem->auditEvent.commandTag = savedTag;
+        stackItem->auditEvent.command = savedCommand;
+        stackItem->auditEvent.objectType = savedType;
+        stackItem->auditEvent.objectName = savedName;
+        stackItem->auditEvent.logged = savedLogged;
+    }
+
+cleanup:
+    MemoryContextSwitchTo(oldContext);
+}
+/* WHPG PATCH Ends */
+
