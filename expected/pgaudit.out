@@ -223,23 +223,22 @@ WARNING:  AUDIT: OBJECT,3,1,READ,SELECT,TABLE,public.test2,<previously logged>,<
 --
 -- Object logged because of:
 -- insert on test3
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
-WARNING:  AUDIT: SESSION,4,1,WRITE,INSERT,,,"WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;",<not logged>
-WARNING:  AUDIT: OBJECT,4,1,WRITE,INSERT,TABLE,public.test3,<previously logged>,<previously logged>
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
+WARNING:  AUDIT: SESSION,4,1,READ,SELECT,,,SELECT 1;,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 DO $$ BEGIN PERFORM test2_change(91); END $$;
 WARNING:  AUDIT: SESSION,5,1,READ,SELECT,,,SELECT test2_change(91),<not logged>
 WARNING:  AUDIT: SESSION,5,2,WRITE,UPDATE,,,"UPDATE test2
@@ -250,52 +249,48 @@ WARNING:  AUDIT: OBJECT,5,2,WRITE,UPDATE,TABLE,public.test2,<previously logged>,
 -- Object logged because of:
 -- insert on test3
 -- update on test2
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
-WARNING:  AUDIT: SESSION,6,1,WRITE,INSERT,,,"WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;",<not logged>
-WARNING:  AUDIT: OBJECT,6,1,WRITE,INSERT,TABLE,public.test3,<previously logged>,<previously logged>
-WARNING:  AUDIT: OBJECT,6,1,WRITE,UPDATE,TABLE,public.test2,<previously logged>,<previously logged>
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+-- dummy statement to keep the statement id the same
+SELECT 1;
+WARNING:  AUDIT: SESSION,6,1,READ,SELECT,,,SELECT 1;,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 --
 -- Object logged because of:
 -- insert on test2
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
-WARNING:  AUDIT: SESSION,7,1,WRITE,UPDATE,,,"WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;",<not logged>
-WARNING:  AUDIT: OBJECT,7,1,WRITE,INSERT,TABLE,public.test2,<previously logged>,<previously logged>
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
+WARNING:  AUDIT: SESSION,7,1,READ,SELECT,,,SELECT 1;,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 --
 -- Be sure that test has correct contents
+-- WarehousePG: Writable CTEs is disabled, no results
 SELECT *
   FROM test2
  ORDER BY ID;
@@ -303,11 +298,9 @@ WARNING:  AUDIT: SESSION,8,1,READ,SELECT,,,"SELECT *
   FROM test2
  ORDER BY ID;",<not logged>
 WARNING:  AUDIT: OBJECT,8,1,READ,SELECT,TABLE,public.test2,<previously logged>,<previously logged>
- id  
------
-  45
- 127
-(2 rows)
+ id 
+----
+(0 rows)
 
 --
 -- Change permissions of user 2 so that only object logging will be done
@@ -797,7 +790,7 @@ NOTICE:  AUDIT: SESSION,29,2,READ,SELECT,,,SELECT 1,<none>
 explain select 1;
 NOTICE:  AUDIT: SESSION,30,1,READ,SELECT,,,explain select 1;,<none>
 NOTICE:  AUDIT: SESSION,30,2,MISC,EXPLAIN,,,explain select 1;,<none>
-                QUERY PLAN                
+                QUERY PLAN
 ------------------------------------------
  Result  (cost=0.00..0.01 rows=1 width=0)
 (1 row)
@@ -823,6 +816,7 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+          ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
@@ -835,13 +829,15 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+          ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
 	END LOOP;
 END $$;",<none>
 NOTICE:  AUDIT: SESSION,34,2,READ,SELECT,TABLE,public.test,"SELECT id
-		  FROM test",<none>
+		  FROM test
+          ORDER BY id",<none>
 NOTICE:  AUDIT: SESSION,34,3,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
 			 VALUES (result.id + 100)",",,1"
 NOTICE:  AUDIT: SESSION,34,4,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
@@ -1117,6 +1113,7 @@ CREATE TABLE bbb
 	id int
 		references aaa(id)
 );
+--- WarehousePG: non-select trigger is not supported.
 CREATE FUNCTION bbb_insert() RETURNS TRIGGER AS $$
 BEGIN
 	UPDATE bbb set id = new.id + 1;
@@ -1135,13 +1132,8 @@ GRANT UPDATE
 INSERT INTO aaa VALUES (generate_series(1,100));
 NOTICE:  AUDIT: SESSION,66,1,WRITE,INSERT,TABLE,public.aaa,"INSERT INTO aaa VALUES (generate_series(1,100));",<none>
 INSERT INTO bbb VALUES (1);
-NOTICE:  AUDIT: SESSION,67,1,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1);,<none>
-NOTICE:  AUDIT: OBJECT,67,2,WRITE,UPDATE,TABLE,public.aaa,"SELECT 1 FROM ONLY ""public"".""aaa"" x WHERE ""id"" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x",1
-NOTICE:  AUDIT: SESSION,67,2,WRITE,UPDATE,TABLE,public.aaa,"SELECT 1 FROM ONLY ""public"".""aaa"" x WHERE ""id"" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x",1
-NOTICE:  AUDIT: OBJECT,67,3,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,",,,,,,,,,,,,,1"
-NOTICE:  AUDIT: SESSION,67,3,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,",,,,,,,,,,,,,1"
-NOTICE:  AUDIT: OBJECT,67,4,WRITE,UPDATE,TABLE,public.aaa,"SELECT 1 FROM ONLY ""public"".""aaa"" x WHERE ""id"" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x",2
-NOTICE:  AUDIT: SESSION,67,4,WRITE,UPDATE,TABLE,public.aaa,"SELECT 1 FROM ONLY ""public"".""aaa"" x WHERE ""id"" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x",2
+NOTICE:  AUDIT: SESSION,67,1,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1);,<not logged>
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 DROP TABLE bbb;
 DROP TABLE aaa;
 -- Test create table as after extension as been dropped

@@ -185,14 +185,16 @@ SELECT id
 --
 -- Object logged because of:
 -- insert on test3
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
 
 DO $$ BEGIN PERFORM test2_change(91); END $$;
 
@@ -200,32 +202,38 @@ DO $$ BEGIN PERFORM test2_change(91); END $$;
 -- Object logged because of:
 -- insert on test3
 -- update on test2
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+-- dummy statement to keep the statement id the same
+SELECT 1;
 
 --
 -- Object logged because of:
 -- insert on test2
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
+-- WarehousePG: Writable CTEs that are themselves writable are not supported.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
 
 --
 -- Be sure that test has correct contents
+-- WarehousePG: Writable CTEs is disabled, no results
 SELECT *
   FROM test2
  ORDER BY ID;
@@ -573,6 +581,7 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+          ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
@@ -754,6 +763,7 @@ CREATE TABLE bbb
 		references aaa(id)
 );
 
+--- WarehousePG: non-select trigger is not supported.
 CREATE FUNCTION bbb_insert() RETURNS TRIGGER AS $$
 BEGIN
 	UPDATE bbb set id = new.id + 1;
