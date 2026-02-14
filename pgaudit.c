@@ -295,6 +295,7 @@ static inline void pgaudit_ddl_log_sub_objects(
 static inline void pgaudit_ddl_resolve_alter_table_fallback(
                                        AuditEventStackItem *stackItem,
                                        Node *parsetree);
+static void pgaudit_grant_hook(GrantObjectType objType);
 /* WHPG PATCH Ends */
 
 AuditEventStackItem *auditEventStack = NULL;
@@ -1470,56 +1471,6 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
         stackItem->auditEvent.commandText = queryString;
 
         /*
-         * For GRANT/REVOKE, extract the object type from the parse tree.
-         * pg_event_trigger_ddl_commands() doesn't exist in WHPG6, so we
-         * get this directly from the GrantStmt node.
-         */
-        if (stackItem->auditEvent.commandTag == T_GrantStmt)
-        {
-            GrantStmt *grant = (GrantStmt *) parsetree;
-            const char *type = NULL;
-
-            switch (grant->objtype)
-            {
-                case ACL_OBJECT_RELATION:
-                    type = "TABLE";
-                    break;
-                case ACL_OBJECT_SEQUENCE:
-                    type = "SEQUENCE";
-                    break;
-                case ACL_OBJECT_DATABASE:
-                    type = "DATABASE";
-                    break;
-                case ACL_OBJECT_FUNCTION:
-                    type = "FUNCTION";
-                    break;
-                case ACL_OBJECT_LANGUAGE:
-                    type = "LANGUAGE";
-                    break;
-                case ACL_OBJECT_NAMESPACE:
-                    type = "SCHEMA";
-                    break;
-                case ACL_OBJECT_TABLESPACE:
-                    type = "TABLESPACE";
-                    break;
-                case ACL_OBJECT_FDW:
-                    type = "FOREIGN DATA WRAPPER";
-                    break;
-                case ACL_OBJECT_FOREIGN_SERVER:
-                    type = "FOREIGN SERVER";
-                    break;
-                case ACL_OBJECT_TYPE:
-                    type = "TYPE";
-                    break;
-                default:
-                    break;
-            }
-
-            if (type != NULL)
-                stackItem->auditEvent.objectType = pstrdup(type);
-        }
-
-        /*
          * If this is a DO block log it before calling the next ProcessUtility
          * hook.
          */
@@ -1610,100 +1561,6 @@ pgaudit_object_access_hook(ObjectAccessType access,
     if (next_object_access_hook)
         (*next_object_access_hook) (access, classId, objectId, subId, arg);
 }
-
-/* WHPG PATCH Starts */
-/*
- * Hook grant_hook to capture GRANT/REVOKE inside CREATE SCHEMA.
- *
- * Standalone GRANT is handled in the ProcessUtility hook.  But when GRANT
- * appears as a sub-statement of CREATE SCHEMA, it is executed internally
- * by ExecuteGrantStmt without a separate ProcessUtility call, so the only
- * way to capture it is through the grant_hook.
- */
-static void
-pgaudit_grant_hook(GrantObjectType objType)
-{
-    if (next_grant_hook)
-        (*next_grant_hook)(objType);
-
-    if (!auditEventStack || IsAbortedTransactionBlockState())
-        return;
-
-    /* Only handle GRANT inside CREATE SCHEMA; standalone is handled elsewhere */
-    if (auditEventStack->auditEvent.commandTag != T_CreateSchemaStmt)
-        return;
-
-    if (!(auditLogBitmap & LOG_ROLE))
-        return;
-
-    {
-        AuditEventStackItem *stackItem = auditEventStack;
-        const char *type = NULL;
-
-        switch (objType)
-        {
-            case ACL_OBJECT_RELATION:
-                type = "TABLE";
-                break;
-            case ACL_OBJECT_SEQUENCE:
-                type = "SEQUENCE";
-                break;
-            case ACL_OBJECT_DATABASE:
-                type = "DATABASE";
-                break;
-            case ACL_OBJECT_FUNCTION:
-                type = "FUNCTION";
-                break;
-            case ACL_OBJECT_LANGUAGE:
-                type = "LANGUAGE";
-                break;
-            case ACL_OBJECT_NAMESPACE:
-                type = "SCHEMA";
-                break;
-            case ACL_OBJECT_TABLESPACE:
-                type = "TABLESPACE";
-                break;
-            case ACL_OBJECT_FDW:
-                type = "FOREIGN DATA WRAPPER";
-                break;
-            case ACL_OBJECT_FOREIGN_SERVER:
-                type = "FOREIGN SERVER";
-                break;
-            case ACL_OBJECT_TYPE:
-                type = "TYPE";
-                break;
-            default:
-                break;
-        }
-
-        /*
-         * Temporarily override the stack item fields to emit a GRANT
-         * audit event, then restore the originals.
-         */
-        {
-            NodeTag savedTag = stackItem->auditEvent.commandTag;
-            const char *savedCommand = stackItem->auditEvent.command;
-            const char *savedType = stackItem->auditEvent.objectType;
-            char *savedName = stackItem->auditEvent.objectName;
-            bool savedLogged = stackItem->auditEvent.logged;
-
-            stackItem->auditEvent.commandTag = T_GrantStmt;
-            stackItem->auditEvent.command = "GRANT";
-            stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
-            stackItem->auditEvent.objectName = "";
-            stackItem->auditEvent.logged = false;
-
-            log_audit_event(stackItem);
-
-            stackItem->auditEvent.commandTag = savedTag;
-            stackItem->auditEvent.command = savedCommand;
-            stackItem->auditEvent.objectType = savedType;
-            stackItem->auditEvent.objectName = savedName;
-            stackItem->auditEvent.logged = savedLogged;
-        }
-    }
-}
-/* WHPG PATCH Ends */
 
 /*
  * Event trigger functions
@@ -2265,6 +2122,7 @@ _PG_init(void)
     inited = true;
 }
 
+/* WHPG PATCH Starts */
 /*
  * Capture DDL object info from object_access_hook for audit logging.
  *
@@ -2584,3 +2442,108 @@ pgaudit_ddl_resolve_alter_table_fallback(AuditEventStackItem *stackItem,
         }
     }
 }
+
+/*
+ * Map GrantObjectType to a human-readable object type string.
+ */
+static const char *
+pgaudit_grant_type_name(GrantObjectType objType)
+{
+    switch (objType)
+    {
+        case ACL_OBJECT_RELATION:
+            return "TABLE";
+        case ACL_OBJECT_SEQUENCE:
+            return "SEQUENCE";
+        case ACL_OBJECT_DATABASE:
+            return "DATABASE";
+        case ACL_OBJECT_FUNCTION:
+            return "FUNCTION";
+        case ACL_OBJECT_LANGUAGE:
+            return "LANGUAGE";
+        case ACL_OBJECT_NAMESPACE:
+            return "SCHEMA";
+        case ACL_OBJECT_TABLESPACE:
+            return "TABLESPACE";
+        case ACL_OBJECT_FDW:
+            return "FOREIGN DATA WRAPPER";
+        case ACL_OBJECT_FOREIGN_SERVER:
+            return "FOREIGN SERVER";
+        case ACL_OBJECT_TYPE:
+            return "TYPE";
+        default:
+            return NULL;
+    }
+}
+
+/*
+ * Hook grant_hook to capture GRANT/REVOKE object type.
+ *
+ * For standalone GRANT/REVOKE, set the object type on the stack item
+ * so the post-utility log_audit_event picks it up.
+ *
+ * For GRANT inside CREATE SCHEMA, the sub-statement is executed
+ * internally by ExecuteGrantStmt without a separate ProcessUtility
+ * call, so we emit the audit event directly here.
+ */
+static void
+pgaudit_grant_hook(GrantObjectType objType)
+{
+    AuditEventStackItem *stackItem;
+    const char *type;
+
+    if (next_grant_hook)
+        (*next_grant_hook)(objType);
+
+    if (!auditEventStack || IsAbortedTransactionBlockState())
+        return;
+
+    stackItem = auditEventStack;
+    type = pgaudit_grant_type_name(objType);
+
+    /*
+     * Standalone GRANT/REVOKE: just resolve objectType.
+     * Logging happens in the post-utility section of ProcessUtility.
+     */
+    if (stackItem->auditEvent.commandTag == T_GrantStmt)
+    {
+        if (type != NULL)
+            stackItem->auditEvent.objectType = pstrdup(type);
+        return;
+    }
+
+    /* For CREATE SCHEMA sub-GRANTs, emit a separate audit event */
+    if (stackItem->auditEvent.commandTag != T_CreateSchemaStmt)
+        return;
+
+    if (!(auditLogBitmap & LOG_ROLE))
+        return;
+
+    /*
+     * Temporarily override the stack item fields to emit a GRANT
+     * audit event, then restore the originals.
+     */
+    {
+        NodeTag savedTag = stackItem->auditEvent.commandTag;
+        const char *savedCommand = stackItem->auditEvent.command;
+        const char *savedType = stackItem->auditEvent.objectType;
+        char *savedName = stackItem->auditEvent.objectName;
+        bool savedLogged = stackItem->auditEvent.logged;
+
+        stackItem->auditEvent.commandTag = T_GrantStmt;
+        stackItem->auditEvent.command = "GRANT";
+        stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
+        stackItem->auditEvent.objectName = "";
+        stackItem->auditEvent.logged = false;
+
+        log_audit_event(stackItem);
+
+        stackItem->auditEvent.commandTag = savedTag;
+        stackItem->auditEvent.command = savedCommand;
+        stackItem->auditEvent.objectType = savedType;
+        stackItem->auditEvent.objectName = savedName;
+        stackItem->auditEvent.logged = savedLogged;
+    }
+}
+/* WHPG PATCH Ends */
+
