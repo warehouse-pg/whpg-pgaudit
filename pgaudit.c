@@ -1733,7 +1733,14 @@ pgaudit_object_access_hook(ObjectAccessType access,
                 newObj = palloc0(sizeof(AuditDDLObject));
                 newObj->classId = classId;
                 newObj->objectId = objectId;
-                newObj->subId = subId;
+                /*
+                 * For ALTER TABLE, report at table level (subId=0).
+                 * Column-level events (e.g. DROP COLUMN) are handled
+                 * separately by pgaudit_sql_drop.
+                 */
+                newObj->subId =
+                    (target->auditEvent.commandTag == T_AlterTableStmt)
+                    ? 0 : subId;
 
                 /* Append to end of list */
                 if (existing == NULL)
