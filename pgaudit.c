@@ -49,12 +49,6 @@ PG_MODULE_MAGIC;
 
 void _PG_init(void);
 
-/* WHPG PATCH Starts */
-static inline void pgaudit_ddl_object_capture(ObjectAccessType access,
-                                       Oid classId, Oid objectId, int subId,
-                                       void *arg);
-/* WHPG PATCH Ends */
-
 PG_FUNCTION_INFO_V1(pgaudit_ddl_command_end);
 PG_FUNCTION_INFO_V1(pgaudit_sql_drop);
 
@@ -288,6 +282,20 @@ typedef struct AuditEventStackItem
     MemoryContext contextAudit;
     MemoryContextCallback contextCallback;
 } AuditEventStackItem;
+
+/* WHPG PATCH Starts */
+static inline void pgaudit_ddl_object_capture(ObjectAccessType access,
+                                       Oid classId, Oid objectId, int subId,
+                                       void *arg);
+static inline void pgaudit_ddl_resolve_refresh_matview(
+                                       AuditEventStackItem *stackItem,
+                                       Node *parsetree);
+static inline void pgaudit_ddl_log_sub_objects(
+                                       AuditEventStackItem *stackItem);
+static inline void pgaudit_ddl_resolve_alter_table_fallback(
+                                       AuditEventStackItem *stackItem,
+                                       Node *parsetree);
+/* WHPG PATCH Ends */
 
 AuditEventStackItem *auditEventStack = NULL;
 
@@ -1555,31 +1563,9 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
          */
         stack_valid(stackId);
 
-        /*
-         * For REFRESH MATERIALIZED VIEW, the object_access_hook only
-         * sees the transient table's composite type, which we skip.
-         * Resolve the matview from the parse tree before logging.
-         */
-        if (stackItem->auditEvent.commandTag == T_RefreshMatViewStmt &&
-            stackItem->auditEvent.ddlObjects == NULL &&
-            !IsAbortedTransactionBlockState())
-        {
-            RefreshMatViewStmt *rstmt = (RefreshMatViewStmt *) parsetree;
-            Oid relOid = RangeVarGetRelid(rstmt->relation, NoLock, true);
-
-            if (OidIsValid(relOid))
-            {
-                const char *type = pgaudit_ddl_resolve_object_type(
-                    RelationRelationId, relOid, 0);
-                const char *name = pgaudit_ddl_resolve_object_name(
-                    RelationRelationId, relOid, 0);
-
-                stackItem->auditEvent.objectType =
-                    type ? pstrdup(type) : "";
-                stackItem->auditEvent.objectName =
-                    name ? pstrdup(name) : "";
-            }
-        }
+        /* WHPG PATCH Starts */
+        pgaudit_ddl_resolve_refresh_matview(stackItem, parsetree);
+        /* WHPG PATCH Ends */
 
         /*
          * Log the utility command if logging is on, the command has not
@@ -1589,84 +1575,10 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
         if (auditLogBitmap != 0 && !stackItem->auditEvent.logged)
             log_audit_event(stackItem);
 
-        /*
-         * For commands with multiple sub-objects (CREATE SCHEMA, ALTER TABLE),
-         * emit additional audit events for each sub-object beyond the first.
-         */
-        if (stackItem->auditEvent.ddlObjects != NULL &&
-            stackItem->auditEvent.ddlObjects->next != NULL)
-        {
-            AuditDDLObject *obj = stackItem->auditEvent.ddlObjects->next;
-
-            while (obj != NULL)
-            {
-                PG_TRY();
-                {
-                    const char *type = pgaudit_ddl_resolve_object_type(
-                        obj->classId, obj->objectId, obj->subId);
-                    const char *name = pgaudit_ddl_resolve_object_name(
-                        obj->classId, obj->objectId, obj->subId);
-
-                    stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
-                    stackItem->auditEvent.objectName = name ? pstrdup(name) : "";
-
-                    /* Override command for CREATE SCHEMA/TABLE sub-objects */
-                    if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt ||
-                        stackItem->auditEvent.commandTag == T_CreateStmt)
-                        stackItem->auditEvent.command =
-                            psprintf("CREATE %s", type ? type : "UNKNOWN");
-
-                    stackItem->auditEvent.logged = false;
-                    log_audit_event(stackItem);
-                }
-                PG_CATCH();
-                {
-                    FlushErrorState();
-                }
-                PG_END_TRY();
-
-                obj = obj->next;
-            }
-        }
-
-        /*
-         * For ALTER TABLE sub-commands that only fire OAT_DROP (e.g.
-         * DROP COLUMN), ddlObjects is empty because our hook doesn't
-         * capture OAT_DROP.  The column event is handled by
-         * pgaudit_sql_drop, but the table-level event is missing.
-         * Emit it here by resolving the table OID from the parse tree.
-         */
-        if (stackItem->auditEvent.commandTag == T_AlterTableStmt &&
-            stackItem->auditEvent.ddlObjects == NULL &&
-            stackItem->auditEvent.logged)
-        {
-            AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
-            Oid relOid = RangeVarGetRelid(atstmt->relation, NoLock, true);
-
-            if (OidIsValid(relOid))
-            {
-                PG_TRY();
-                {
-                    const char *type = pgaudit_ddl_resolve_object_type(
-                        RelationRelationId, relOid, 0);
-                    const char *name = pgaudit_ddl_resolve_object_name(
-                        RelationRelationId, relOid, 0);
-
-                    stackItem->auditEvent.objectType =
-                        type ? pstrdup(type) : "";
-                    stackItem->auditEvent.objectName =
-                        name ? pstrdup(name) : "";
-                    stackItem->auditEvent.logged = false;
-                    log_audit_event(stackItem);
-                }
-                PG_CATCH();
-                {
-                    FlushErrorState();
-                }
-                PG_END_TRY();
-            }
-        }
-
+        /* WHPG PATCH Starts */
+        pgaudit_ddl_log_sub_objects(stackItem);
+        pgaudit_ddl_resolve_alter_table_fallback(stackItem, parsetree);
+        /* WHPG PATCH Ends */
     }
 }
 
@@ -2553,4 +2465,122 @@ pgaudit_ddl_object_capture(ObjectAccessType access,
     }
 
     MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * For REFRESH MATERIALIZED VIEW, the object_access_hook only
+ * sees the transient table's composite type, which we skip.
+ * Resolve the matview from the parse tree before logging.
+ */
+static inline void
+pgaudit_ddl_resolve_refresh_matview(AuditEventStackItem *stackItem,
+                                    Node *parsetree)
+{
+    if (stackItem->auditEvent.commandTag == T_RefreshMatViewStmt)
+    {
+        RefreshMatViewStmt *rstmt = (RefreshMatViewStmt *) parsetree;
+        Oid relOid = RangeVarGetRelid(rstmt->relation, NoLock, true);
+
+        if (OidIsValid(relOid))
+        {
+            const char *type = pgaudit_ddl_resolve_object_type(
+                RelationRelationId, relOid, 0);
+            const char *name = pgaudit_ddl_resolve_object_name(
+                RelationRelationId, relOid, 0);
+
+            stackItem->auditEvent.objectType =
+                type ? pstrdup(type) : "";
+            stackItem->auditEvent.objectName =
+                name ? pstrdup(name) : "";
+        }
+    }
+}
+
+/*
+ * For commands with multiple sub-objects (CREATE SCHEMA, ALTER TABLE),
+ * emit additional audit events for each sub-object beyond the first.
+ */
+static inline void
+pgaudit_ddl_log_sub_objects(AuditEventStackItem *stackItem)
+{
+    if (stackItem->auditEvent.ddlObjects != NULL &&
+        stackItem->auditEvent.ddlObjects->next != NULL)
+    {
+        /* Start from the 2nd element. The 1st has been logged in the previous
+         * log_audit_event. */
+        AuditDDLObject *obj = stackItem->auditEvent.ddlObjects->next;
+
+        while (obj != NULL)
+        {
+            PG_TRY();
+            {
+                const char *type = pgaudit_ddl_resolve_object_type(
+                    obj->classId, obj->objectId, obj->subId);
+                const char *name = pgaudit_ddl_resolve_object_name(
+                    obj->classId, obj->objectId, obj->subId);
+
+                stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
+                stackItem->auditEvent.objectName = name ? pstrdup(name) : "";
+
+                /* Override command for CREATE SCHEMA/TABLE sub-objects */
+                if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt ||
+                    stackItem->auditEvent.commandTag == T_CreateStmt)
+                    stackItem->auditEvent.command =
+                        psprintf("CREATE %s", type ? type : "UNKNOWN");
+
+                stackItem->auditEvent.logged = false;
+                log_audit_event(stackItem);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+
+            obj = obj->next;
+        }
+    }
+}
+
+/*
+ * For ALTER TABLE sub-commands that only fire OAT_DROP (e.g.
+ * DROP COLUMN), ddlObjects is empty because our hook doesn't
+ * capture OAT_DROP.  The column event is handled by
+ * pgaudit_sql_drop, but the table-level event is missing.
+ * Emit it here by resolving the table OID from the parse tree.
+ */
+static inline void
+pgaudit_ddl_resolve_alter_table_fallback(AuditEventStackItem *stackItem,
+                                         Node *parsetree)
+{
+    if (stackItem->auditEvent.commandTag == T_AlterTableStmt &&
+        stackItem->auditEvent.ddlObjects == NULL &&
+        stackItem->auditEvent.logged)
+    {
+        AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+        Oid relOid = RangeVarGetRelid(atstmt->relation, NoLock, true);
+
+        if (OidIsValid(relOid))
+        {
+            PG_TRY();
+            {
+                const char *type = pgaudit_ddl_resolve_object_type(
+                    RelationRelationId, relOid, 0);
+                const char *name = pgaudit_ddl_resolve_object_name(
+                    RelationRelationId, relOid, 0);
+
+                stackItem->auditEvent.objectType =
+                    type ? pstrdup(type) : "";
+                stackItem->auditEvent.objectName =
+                    name ? pstrdup(name) : "";
+                stackItem->auditEvent.logged = false;
+                log_audit_event(stackItem);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+        }
+    }
 }
