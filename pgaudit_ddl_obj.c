@@ -25,6 +25,7 @@
 #include "access/sysattr.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
@@ -119,6 +120,60 @@ pgaudit_ddl_resolve_object_type(Oid classId, Oid objectId, int subId)
 			heap_freetuple(tup);
 			heap_close(rel, AccessShareLock);
 			return pstrdup("TRIGGER");
+		}
+
+		heap_close(rel, AccessShareLock);
+		return NULL;
+	}
+
+	/*
+	 * For pg_class entries (subId=0), use direct scan to bypass stale
+	 * syscache after RENAME or SET SCHEMA.
+	 */
+	if (classId == RelationRelationId && subId == 0)
+	{
+		Relation	rel;
+		HeapTuple	tup;
+
+		tup = fetch_catalog_tuple_self(RelationRelationId,
+									   ClassOidIndexId,
+									   objectId, &rel);
+		if (HeapTupleIsValid(tup))
+		{
+			Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tup);
+			const char *type;
+
+			switch (classForm->relkind)
+			{
+				case RELKIND_RELATION:
+					type = "TABLE";
+					break;
+				case RELKIND_INDEX:
+					type = "INDEX";
+					break;
+				case RELKIND_SEQUENCE:
+					type = "SEQUENCE";
+					break;
+				case RELKIND_VIEW:
+					type = "VIEW";
+					break;
+				case RELKIND_MATVIEW:
+					type = "MATERIALIZED VIEW";
+					break;
+				case RELKIND_COMPOSITE_TYPE:
+					type = "TYPE";
+					break;
+				case RELKIND_FOREIGN_TABLE:
+					type = "FOREIGN TABLE";
+					break;
+				default:
+					type = "RELATION";
+					break;
+			}
+
+			heap_freetuple(tup);
+			heap_close(rel, AccessShareLock);
+			return pstrdup(type);
 		}
 
 		heap_close(rel, AccessShareLock);
@@ -256,6 +311,39 @@ pgaudit_ddl_resolve_object_name(Oid classId, Oid objectId, int subId)
 				result = psprintf("%s on %s", tgname, relname);
 			else
 				result = pstrdup(tgname);
+
+			heap_freetuple(tup);
+			heap_close(rel, AccessShareLock);
+			return result;
+		}
+
+		heap_close(rel, AccessShareLock);
+		return NULL;
+	}
+
+	/*
+	 * For pg_class entries (subId=0), use direct scan to bypass stale
+	 * syscache after RENAME or SET SCHEMA.
+	 */
+	if (classId == RelationRelationId && subId == 0)
+	{
+		Relation	rel;
+		HeapTuple	tup;
+
+		tup = fetch_catalog_tuple_self(RelationRelationId,
+									   ClassOidIndexId,
+									   objectId, &rel);
+		if (HeapTupleIsValid(tup))
+		{
+			Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tup);
+			char	   *relname = NameStr(classForm->relname);
+			char	   *nspname = get_namespace_name(classForm->relnamespace);
+			char	   *result;
+
+			if (nspname)
+				result = psprintf("%s.%s", nspname, relname);
+			else
+				result = pstrdup(relname);
 
 			heap_freetuple(tup);
 			heap_close(rel, AccessShareLock);

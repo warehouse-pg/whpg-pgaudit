@@ -1577,8 +1577,9 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
                     stackItem->auditEvent.objectType = type ? pstrdup(type) : "";
                     stackItem->auditEvent.objectName = name ? pstrdup(name) : "";
 
-                    /* Only override command for CREATE SCHEMA sub-objects */
-                    if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt)
+                    /* Override command for CREATE SCHEMA/TABLE sub-objects */
+                    if (stackItem->auditEvent.commandTag == T_CreateSchemaStmt ||
+                        stackItem->auditEvent.commandTag == T_CreateStmt)
                         stackItem->auditEvent.command =
                             psprintf("CREATE %s", type ? type : "UNKNOWN");
 
@@ -1719,11 +1720,15 @@ pgaudit_object_access_hook(ObjectAccessType access,
              * sub-object (tables, views, etc.) as a separate audit event.
              * For ALTER TABLE, append all sub-events (e.g. DROP COLUMN
              * fires for both the column and the table).
+             * For CREATE TABLE, append so we capture indexes created
+             * by PRIMARY KEY / UNIQUE constraints.
              */
-            if ((target->auditEvent.commandTag == T_CreateSchemaStmt ||
-                 target->auditEvent.commandTag == T_AlterTableStmt) &&
-                !is_internal &&
-                classId != TypeRelationId)
+            if ((((target->auditEvent.commandTag == T_CreateSchemaStmt ||
+                   target->auditEvent.commandTag == T_AlterTableStmt) &&
+                  classId != TypeRelationId) ||
+                 (target->auditEvent.commandTag == T_CreateStmt &&
+                  classId == RelationRelationId)) &&
+                !is_internal)
             {
                 newObj = palloc0(sizeof(AuditDDLObject));
                 newObj->classId = classId;
@@ -1743,7 +1748,15 @@ pgaudit_object_access_hook(ObjectAccessType access,
             /*
              * For other commands, store only the first object, except
              * prefer a Relation over a Type (composite type case).
+             * For CREATE TABLE, skip TypeRelationId entirely — the
+             * composite type hook fires before the table hook, and we
+             * don't want it stored even as the first entry.
              */
+            else if (classId == TypeRelationId &&
+                     target->auditEvent.commandTag == T_CreateStmt)
+            {
+                /* skip */
+            }
             else if (existing == NULL ||
                      (classId == RelationRelationId &&
                       existing->classId == TypeRelationId))
