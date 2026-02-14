@@ -1132,7 +1132,7 @@ GRANT UPDATE
 INSERT INTO aaa VALUES (generate_series(1,100));
 NOTICE:  AUDIT: SESSION,66,1,WRITE,INSERT,TABLE,public.aaa,"INSERT INTO aaa VALUES (generate_series(1,100));",<none>
 INSERT INTO bbb VALUES (1);
-NOTICE:  AUDIT: SESSION,67,1,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1);,<not logged>
+NOTICE:  AUDIT: SESSION,67,1,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1);,<none>
 ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 DROP TABLE bbb;
 DROP TABLE aaa;
