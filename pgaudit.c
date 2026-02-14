@@ -27,7 +27,6 @@
 #include "nodes/nodes.h"
 #include "nodes/params.h"
 #include "tcop/utility.h"
-#include "tcop/deparse_utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -36,6 +35,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+
+/* WHPG PATCH Starts */
+#include "cdb/cdbvars.h"
+/* WHPG PATCH Ends */
 
 PG_MODULE_MAGIC;
 
@@ -560,6 +563,7 @@ log_audit_event(AuditEventStackItem *stackItem)
                             stackItem->auditEvent.commandText = commandStr;
                         }
                     }
+                /* Fall through */
 
                 /* Classify role statements */
                 case T_GrantStmt:
@@ -1126,23 +1130,14 @@ log_select_dml(Oid auditOid, List *rangeTabls)
                                                ACL_SELECT);
 
                 /*
-                 * Check the insert columns
+                 * Check the modified columns (INSERT/UPDATE share modifiedCols
+                 * in PG9.4)
                  */
                 if (!auditEventStack->auditEvent.granted &&
-                    auditPerms & ACL_INSERT)
+                    (auditPerms & (ACL_INSERT | ACL_UPDATE)))
                     auditEventStack->auditEvent.granted =
                         audit_on_any_attribute(relOid, auditOid,
-                                               rte->insertedCols,
-                                               auditPerms);
-
-                /*
-                 * Check the update columns
-                 */
-                if (!auditEventStack->auditEvent.granted &&
-                    auditPerms & ACL_UPDATE)
-                    auditEventStack->auditEvent.granted =
-                        audit_on_any_attribute(relOid, auditOid,
-                                               rte->updatedCols,
+                                               rte->modifiedCols,
                                                auditPerms);
             }
         }
@@ -1845,6 +1840,14 @@ _PG_init(void)
 
     if (inited)
         return;
+
+/* WHPG PATCH Starts */
+    /* In Greenplum, only run on the query dispatcher (coordinator) */
+    if (!IS_QUERY_DISPATCHER())
+    {
+        return;
+    }
+/* WHPG PATCH Ends */
 
     /* Must be loaded with shared_preload_libraries */
     if (!process_shared_preload_libraries_in_progress)
