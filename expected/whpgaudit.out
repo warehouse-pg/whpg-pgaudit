@@ -1,0 +1,48 @@
+\set VERBOSITY terse
+-- Create pgaudit extension
+CREATE EXTENSION IF NOT EXISTS pgaudit;
+--
+-- WHPG-specific audit tests
+--
+SET pgaudit.log = 'DDL, READ';
+SET pgaudit.log_client = ON;
+SET pgaudit.log_level = 'notice';
+-- Setup base table
+CREATE TABLE src (id int, data text);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,1,1,DDL,CREATE TABLE,TABLE,public.src,"CREATE TABLE src (id int, data text);",<not logged>
+INSERT INTO src VALUES (1, 'one'), (2, 'two');
+-- SELECT INTO (rewritten to CTAS internally, is_select_into=true)
+SELECT * INTO dst_select_into FROM src;
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,2,1,READ,SELECT,,,SELECT * INTO dst_select_into FROM src;,<not logged>
+NOTICE:  AUDIT: SESSION,2,2,DDL,SELECT INTO,TABLE,public.dst_select_into,SELECT * INTO dst_select_into FROM src;,<not logged>
+-- CREATE MATERIALIZED VIEW
+CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greenplum Database data distribution key for this table.
+NOTICE:  AUDIT: SESSION,3,1,READ,SELECT,,,CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;,<not logged>
+NOTICE:  AUDIT: SESSION,3,2,DDL,CREATE MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,CREATE MATERIALIZED VIEW mv_src AS SELECT * FROM src;,<not logged>
+-- REFRESH MATERIALIZED VIEW
+REFRESH MATERIALIZED VIEW mv_src;
+NOTICE:  AUDIT: SESSION,4,1,READ,SELECT,,,REFRESH MATERIALIZED VIEW mv_src;,<not logged>
+NOTICE:  AUDIT: SESSION,4,2,DDL,REFRESH MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,REFRESH MATERIALIZED VIEW mv_src;,<not logged>
+-- CREATE TYPE (composite)
+CREATE TYPE comp_type AS (x int, y text);
+NOTICE:  AUDIT: SESSION,5,1,DDL,CREATE TYPE,TYPE,public.comp_type,"CREATE TYPE comp_type AS (x int, y text);",<not logged>
+DROP TYPE comp_type;
+NOTICE:  AUDIT: SESSION,6,1,DDL,DROP TYPE,COMPOSITE TYPE,public.comp_type,DROP TYPE comp_type;,<not logged>
+-- CREATE TYPE (enum)
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+NOTICE:  AUDIT: SESSION,7,1,DDL,CREATE TYPE,TYPE,,"CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');",<not logged>
+DROP TYPE mood;
+NOTICE:  AUDIT: SESSION,8,1,DDL,DROP TYPE,,,DROP TYPE mood;,<not logged>
+-- Cleanup
+DROP MATERIALIZED VIEW mv_src;
+NOTICE:  AUDIT: SESSION,9,1,DDL,DROP MATERIALIZED VIEW,MATERIALIZED VIEW,public.mv_src,DROP MATERIALIZED VIEW mv_src;,<not logged>
+DROP TABLE dst_select_into;
+NOTICE:  AUDIT: SESSION,10,1,DDL,DROP TABLE,TABLE,public.dst_select_into,DROP TABLE dst_select_into;,<not logged>
+DROP TABLE src;
+NOTICE:  AUDIT: SESSION,11,1,DDL,DROP TABLE,TABLE,public.src,DROP TABLE src;,<not logged>
+RESET pgaudit.log;
+RESET pgaudit.log_client;
+RESET pgaudit.log_level;

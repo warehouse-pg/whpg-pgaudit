@@ -32,6 +32,7 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1555,6 +1556,32 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
         stack_valid(stackId);
 
         /*
+         * For REFRESH MATERIALIZED VIEW, the object_access_hook only
+         * sees the transient table's composite type, which we skip.
+         * Resolve the matview from the parse tree before logging.
+         */
+        if (stackItem->auditEvent.commandTag == T_RefreshMatViewStmt &&
+            stackItem->auditEvent.ddlObjects == NULL &&
+            !IsAbortedTransactionBlockState())
+        {
+            RefreshMatViewStmt *rstmt = (RefreshMatViewStmt *) parsetree;
+            Oid relOid = RangeVarGetRelid(rstmt->relation, NoLock, true);
+
+            if (OidIsValid(relOid))
+            {
+                const char *type = pgaudit_ddl_resolve_object_type(
+                    RelationRelationId, relOid, 0);
+                const char *name = pgaudit_ddl_resolve_object_name(
+                    RelationRelationId, relOid, 0);
+
+                stackItem->auditEvent.objectType =
+                    type ? pstrdup(type) : "";
+                stackItem->auditEvent.objectName =
+                    name ? pstrdup(name) : "";
+            }
+        }
+
+        /*
          * Log the utility command if logging is on, the command has not
          * already been logged by another hook, and the transaction is not
          * aborted.
@@ -1639,6 +1666,7 @@ pgaudit_ProcessUtility_hook(Node *parsetree,
                 PG_END_TRY();
             }
         }
+
     }
 }
 
@@ -2336,6 +2364,40 @@ _PG_init(void)
  * Objects are stored in a per-stack-item linked list (ddlObjects).  For most
  * commands only the first object is kept, but CREATE SCHEMA, ALTER TABLE, and
  * CREATE TABLE append all sub-objects so multiple audit events can be emitted.
+ *
+ * Hook calling order for key DDL commands (from heap_create_with_catalog):
+ *
+ *   CREATE TABLE (T_CreateStmt):
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, typeOid)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, tableOid)
+ *     3. index_create     -> OAT_POST_CREATE(RelationRelationId, indexOid)
+ *        (only if PRIMARY KEY / UNIQUE constraint exists)
+ *
+ *   CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED VIEW
+ *   (T_CreateTableAsStmt, with T_SelectStmt on top of stack):
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, typeOid)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, relOid)
+ *
+ *   CREATE SCHEMA (T_CreateSchemaStmt):
+ *     Per sub-object (table, view, etc.), same sequence as above.
+ *
+ *   ALTER TABLE (T_AlterTableStmt):
+ *     ADD COLUMN:  OAT_POST_ALTER(RelationRelationId, tableOid, attnum)
+ *     RENAME:      OAT_POST_ALTER(RelationRelationId, tableOid, 0)
+ *     DROP COLUMN: OAT_DROP only (handled by pgaudit_sql_drop)
+ *
+ *   REFRESH MATERIALIZED VIEW (T_RefreshMatViewStmt):
+ *     make_new_heap creates a transient table internally:
+ *     1. TypeCreate       -> OAT_POST_CREATE(TypeRelationId, is_internal=false)
+ *     2. heap_create      -> OAT_POST_CREATE(RelationRelationId, is_internal=true)
+ *     Neither is useful — we skip and resolve from the parse tree instead.
+ *
+ *   Other DDL (CREATE VIEW, CREATE INDEX, CREATE FUNCTION, etc.):
+ *     Typically fires TypeRelationId first, then RelationRelationId.
+ *     The single-object fallback stores the first and lets
+ *     RelationRelationId overwrite TypeRelationId if both fire.
+ *     For types without a backing relation (ENUM, RANGE), only
+ *     TypeRelationId fires and is kept as-is.
  */
 static inline void
 pgaudit_ddl_object_capture(ObjectAccessType access,
@@ -2360,28 +2422,6 @@ pgaudit_ddl_object_capture(ObjectAccessType access,
     }
 
     /*
-     * For CREATE TABLE AS, the executor pushes a SELECT item on
-     * top of the DDL item.  Skip it to reach the parent DDL.
-     */
-    target = auditEventStack;
-
-    if (target->auditEvent.commandTag == T_SelectStmt &&
-        target->next != NULL &&
-        target->next->auditEvent.commandTag == T_CreateTableAsStmt)
-    {
-        target = target->next;
-    }
-
-    /*
-     * Skip role statements - pgaudit does not report object
-     * info for CREATE/ALTER ROLE.
-     */
-    if (target->auditEvent.commandTag == T_CreateRoleStmt ||
-        target->auditEvent.commandTag == T_AlterRoleStmt ||
-        target->auditEvent.commandTag == T_AlterRoleSetStmt)
-        return;
-
-    /*
      * Skip global objects (DATABASE, TABLESPACE) whose catalog entries
      * may not be visible due to special transaction handling.
      */
@@ -2389,6 +2429,54 @@ pgaudit_ddl_object_capture(ObjectAccessType access,
         classId == DatabaseRelationId ||
         classId == TableSpaceRelationId)
         return;
+
+    target = auditEventStack;
+
+    /*
+     * Route by command tag.  Only commands listed here (or falling
+     * through to default) will have hook-captured objects stored.
+     */
+    switch (target->auditEvent.commandTag)
+    {
+        /* CTAS / SELECT INTO / CREATE MATVIEW: walk past SELECT */
+        case T_SelectStmt:
+            if (target->next != NULL &&
+                target->next->auditEvent.commandTag == T_CreateTableAsStmt)
+                target = target->next;
+            else
+                return;
+            break;
+
+        /* Multi-object commands with explicit handling below */
+        case T_CreateStmt:
+            /*
+             * heap_create_with_catalog fires two hooks in order:
+             *   1. TypeCreate  -> OAT_POST_CREATE(TypeRelationId)
+             *   2. heap_create -> OAT_POST_CREATE(RelationRelationId)
+             *
+             * CREATE TABLE uses the multi-object append path below,
+             * which only accepts RelationRelationId.  Skip the
+             * composite type hook entirely so it is never stored.
+             */
+            if (classId == TypeRelationId)
+                return;
+            break;
+        case T_CreateSchemaStmt:
+        case T_AlterTableStmt:
+        case T_CreateTableAsStmt:
+            break;
+
+        /* Commands whose hook objects are not useful for auditing */
+        case T_CreateRoleStmt:
+        case T_AlterRoleStmt:
+        case T_AlterRoleSetStmt:
+        case T_RefreshMatViewStmt:
+            return;
+
+        /* All other DDL: single-object fallback */
+        default:
+            break;
+    }
 
     existing = target->auditEvent.ddlObjects;
 
@@ -2410,8 +2498,7 @@ pgaudit_ddl_object_capture(ObjectAccessType access,
            target->auditEvent.commandTag == T_AlterTableStmt) &&
           classId != TypeRelationId) ||
          (target->auditEvent.commandTag == T_CreateStmt &&
-          classId == RelationRelationId)) &&
-        !is_internal)
+          classId == RelationRelationId)))
     {
         newObj = palloc0(sizeof(AuditDDLObject));
         newObj->classId = classId;
@@ -2436,17 +2523,21 @@ pgaudit_ddl_object_capture(ObjectAccessType access,
         }
     }
     /*
-     * For other commands, store only the first object, except
-     * prefer a Relation over a Type (composite type case).
-     * For CREATE TABLE, skip TypeRelationId entirely — the
-     * composite type hook fires before the table hook, and we
-     * don't want it stored even as the first entry.
+     * Single-object fallback for all other DDL commands (e.g.
+     * CREATE VIEW, CREATE INDEX, CREATE FUNCTION, RENAME, etc.).
+     *
+     * heap_create_with_catalog fires two hooks in order:
+     *   1. TypeCreate  -> OAT_POST_CREATE(TypeRelationId)   (composite type)
+     *   2. heap_create -> OAT_POST_CREATE(RelationRelationId) (the relation)
+     *
+     * We only want the relation, not the composite type.  Since the
+     * type hook fires first and would be stored as the first entry,
+     * we allow the later relation hook to overwrite it (the
+     * RelationRelationId-over-TypeRelationId preference below).
+     *
+     * Note: CREATE TABLE (T_CreateStmt) TypeRelationId skip is
+     * handled in the switch above, not here.
      */
-    else if (classId == TypeRelationId &&
-             target->auditEvent.commandTag == T_CreateStmt)
-    {
-        /* skip */
-    }
     else if (existing == NULL ||
              (classId == RelationRelationId &&
               existing->classId == TypeRelationId))
