@@ -48,6 +48,12 @@ PG_MODULE_MAGIC;
 
 void _PG_init(void);
 
+/* WHPG PATCH Starts */
+static inline void pgaudit_ddl_object_capture(ObjectAccessType access,
+                                       Oid classId, Oid objectId, int subId,
+                                       void *arg);
+/* WHPG PATCH Ends */
+
 PG_FUNCTION_INFO_V1(pgaudit_ddl_command_end);
 PG_FUNCTION_INFO_V1(pgaudit_sql_drop);
 
@@ -1652,134 +1658,12 @@ pgaudit_object_access_hook(ObjectAccessType access,
         log_function_execute(objectId);
 
 /* WHPG PATCH Starts */
-    /*
-     * Capture object info for DDL auditing.
-     * This replaces pg_event_trigger_ddl_commands() which doesn't exist in PG9.4.
-     * Only store OIDs here - resolution is deferred to log_audit_event time.
-     */
+    /* Capture DDL object info for audit logging */
     if ((access == OAT_POST_CREATE || access == OAT_POST_ALTER) &&
         (auditLogBitmap & (LOG_DDL | LOG_ROLE)) &&
         auditEventStack && !IsAbortedTransactionBlockState())
     {
-        bool is_internal = false;
-
-        if (access == OAT_POST_CREATE)
-        {
-            ObjectAccessPostCreate *pc_arg = (ObjectAccessPostCreate *) arg;
-            is_internal = pc_arg ? pc_arg->is_internal : false;
-        }
-        else
-        {
-            ObjectAccessPostAlter *pa_arg = (ObjectAccessPostAlter *) arg;
-            is_internal = pa_arg ? pa_arg->is_internal : false;
-        }
-
-        /*
-         * For CREATE TABLE AS, the executor pushes a SELECT item on
-         * top of the DDL item.  Skip it to reach the parent DDL.
-         */
-        AuditEventStackItem *target = auditEventStack;
-
-        if (target->auditEvent.commandTag == T_SelectStmt &&
-            target->next != NULL &&
-            target->next->auditEvent.commandTag == T_CreateTableAsStmt)
-        {
-            target = target->next;
-        }
-
-        /*
-         * Skip role statements - pgaudit does not report object
-         * info for CREATE/ALTER ROLE.
-         */
-        if (target->auditEvent.commandTag == T_CreateRoleStmt ||
-            target->auditEvent.commandTag == T_AlterRoleStmt ||
-            target->auditEvent.commandTag == T_AlterRoleSetStmt)
-        {
-            /* do nothing */
-        }
-        /*
-         * Skip global objects (DATABASE, TABLESPACE) whose catalog entries
-         * may not be visible due to special transaction handling.
-         */
-        else if (!is_internal &&
-            classId != DatabaseRelationId &&
-            classId != TableSpaceRelationId)
-        {
-            AuditDDLObject *newObj;
-            AuditDDLObject *existing = target->auditEvent.ddlObjects;
-            MemoryContext oldContext;
-
-            /*
-             * Allocate in the stack item's memory context so the object
-             * survives until log_audit_event is called.
-             */
-            oldContext = MemoryContextSwitchTo(target->contextAudit);
-
-            /*
-             * For CREATE SCHEMA, always append - we want to log each
-             * sub-object (tables, views, etc.) as a separate audit event.
-             * For ALTER TABLE, append all sub-events (e.g. DROP COLUMN
-             * fires for both the column and the table).
-             * For CREATE TABLE, append so we capture indexes created
-             * by PRIMARY KEY / UNIQUE constraints.
-             */
-            if ((((target->auditEvent.commandTag == T_CreateSchemaStmt ||
-                   target->auditEvent.commandTag == T_AlterTableStmt) &&
-                  classId != TypeRelationId) ||
-                 (target->auditEvent.commandTag == T_CreateStmt &&
-                  classId == RelationRelationId)) &&
-                !is_internal)
-            {
-                newObj = palloc0(sizeof(AuditDDLObject));
-                newObj->classId = classId;
-                newObj->objectId = objectId;
-                /*
-                 * For ALTER TABLE, report at table level (subId=0).
-                 * Column-level events (e.g. DROP COLUMN) are handled
-                 * separately by pgaudit_sql_drop.
-                 */
-                newObj->subId =
-                    (target->auditEvent.commandTag == T_AlterTableStmt)
-                    ? 0 : subId;
-
-                /* Append to end of list */
-                if (existing == NULL)
-                    target->auditEvent.ddlObjects = newObj;
-                else
-                {
-                    while (existing->next != NULL)
-                        existing = existing->next;
-                    existing->next = newObj;
-                }
-            }
-            /*
-             * For other commands, store only the first object, except
-             * prefer a Relation over a Type (composite type case).
-             * For CREATE TABLE, skip TypeRelationId entirely — the
-             * composite type hook fires before the table hook, and we
-             * don't want it stored even as the first entry.
-             */
-            else if (classId == TypeRelationId &&
-                     target->auditEvent.commandTag == T_CreateStmt)
-            {
-                /* skip */
-            }
-            else if (existing == NULL ||
-                     (classId == RelationRelationId &&
-                      existing->classId == TypeRelationId))
-            {
-                if (existing == NULL)
-                {
-                    existing = palloc0(sizeof(AuditDDLObject));
-                    target->auditEvent.ddlObjects = existing;
-                }
-                existing->classId = classId;
-                existing->objectId = objectId;
-                existing->subId = subId;
-            }
-
-            MemoryContextSwitchTo(oldContext);
-        }
+        pgaudit_ddl_object_capture(access, classId, objectId, subId, arg);
     }
 /* WHPG PATCH Ends */
 
@@ -2439,4 +2323,143 @@ _PG_init(void)
 #endif /* EXEC_BACKEND */
 
     inited = true;
+}
+
+/*
+ * Capture DDL object info from object_access_hook for audit logging.
+ *
+ * This replaces pg_event_trigger_ddl_commands() which doesn't exist in PG9.4.
+ * Only OIDs are stored here — resolution to type/name strings is deferred to
+ * log_audit_event time, after ProcessUtility completes and the catalog is
+ * consistent.
+ *
+ * Objects are stored in a per-stack-item linked list (ddlObjects).  For most
+ * commands only the first object is kept, but CREATE SCHEMA, ALTER TABLE, and
+ * CREATE TABLE append all sub-objects so multiple audit events can be emitted.
+ */
+static inline void
+pgaudit_ddl_object_capture(ObjectAccessType access,
+                           Oid classId, Oid objectId, int subId,
+                           void *arg)
+{
+    bool is_internal = false;
+    AuditEventStackItem *target;
+    AuditDDLObject *newObj;
+    AuditDDLObject *existing;
+    MemoryContext oldContext;
+
+    if (access == OAT_POST_CREATE)
+    {
+        ObjectAccessPostCreate *pc_arg = (ObjectAccessPostCreate *) arg;
+        is_internal = pc_arg ? pc_arg->is_internal : false;
+    }
+    else
+    {
+        ObjectAccessPostAlter *pa_arg = (ObjectAccessPostAlter *) arg;
+        is_internal = pa_arg ? pa_arg->is_internal : false;
+    }
+
+    /*
+     * For CREATE TABLE AS, the executor pushes a SELECT item on
+     * top of the DDL item.  Skip it to reach the parent DDL.
+     */
+    target = auditEventStack;
+
+    if (target->auditEvent.commandTag == T_SelectStmt &&
+        target->next != NULL &&
+        target->next->auditEvent.commandTag == T_CreateTableAsStmt)
+    {
+        target = target->next;
+    }
+
+    /*
+     * Skip role statements - pgaudit does not report object
+     * info for CREATE/ALTER ROLE.
+     */
+    if (target->auditEvent.commandTag == T_CreateRoleStmt ||
+        target->auditEvent.commandTag == T_AlterRoleStmt ||
+        target->auditEvent.commandTag == T_AlterRoleSetStmt)
+        return;
+
+    /*
+     * Skip global objects (DATABASE, TABLESPACE) whose catalog entries
+     * may not be visible due to special transaction handling.
+     */
+    if (is_internal ||
+        classId == DatabaseRelationId ||
+        classId == TableSpaceRelationId)
+        return;
+
+    existing = target->auditEvent.ddlObjects;
+
+    /*
+     * Allocate in the stack item's memory context so the object
+     * survives until log_audit_event is called.
+     */
+    oldContext = MemoryContextSwitchTo(target->contextAudit);
+
+    /*
+     * For CREATE SCHEMA, always append - we want to log each
+     * sub-object (tables, views, etc.) as a separate audit event.
+     * For ALTER TABLE, append all sub-events (e.g. DROP COLUMN
+     * fires for both the column and the table).
+     * For CREATE TABLE, append so we capture indexes created
+     * by PRIMARY KEY / UNIQUE constraints.
+     */
+    if ((((target->auditEvent.commandTag == T_CreateSchemaStmt ||
+           target->auditEvent.commandTag == T_AlterTableStmt) &&
+          classId != TypeRelationId) ||
+         (target->auditEvent.commandTag == T_CreateStmt &&
+          classId == RelationRelationId)) &&
+        !is_internal)
+    {
+        newObj = palloc0(sizeof(AuditDDLObject));
+        newObj->classId = classId;
+        newObj->objectId = objectId;
+        /*
+         * For ALTER TABLE, report at table level (subId=0).
+         * Column-level events (e.g. DROP COLUMN) are handled
+         * separately by pgaudit_sql_drop.
+         */
+        newObj->subId =
+            (target->auditEvent.commandTag == T_AlterTableStmt)
+            ? 0 : subId;
+
+        /* Append to end of list */
+        if (existing == NULL)
+            target->auditEvent.ddlObjects = newObj;
+        else
+        {
+            while (existing->next != NULL)
+                existing = existing->next;
+            existing->next = newObj;
+        }
+    }
+    /*
+     * For other commands, store only the first object, except
+     * prefer a Relation over a Type (composite type case).
+     * For CREATE TABLE, skip TypeRelationId entirely — the
+     * composite type hook fires before the table hook, and we
+     * don't want it stored even as the first entry.
+     */
+    else if (classId == TypeRelationId &&
+             target->auditEvent.commandTag == T_CreateStmt)
+    {
+        /* skip */
+    }
+    else if (existing == NULL ||
+             (classId == RelationRelationId &&
+              existing->classId == TypeRelationId))
+    {
+        if (existing == NULL)
+        {
+            existing = palloc0(sizeof(AuditDDLObject));
+            target->auditEvent.ddlObjects = existing;
+        }
+        existing->classId = classId;
+        existing->objectId = objectId;
+        existing->subId = subId;
+    }
+
+    MemoryContextSwitchTo(oldContext);
 }
