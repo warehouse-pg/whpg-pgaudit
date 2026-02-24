@@ -899,8 +899,8 @@ DROP FUNCTION upper(text);
 SET pgaudit.log = 'all,-misc_set';
 SET pgaudit.log_level = 'warning';
 
-CREATE EXTENSION pg_stat_statements;
-ALTER EXTENSION pg_stat_statements UPDATE TO '1.7.1';
+CREATE EXTENSION pg_stat_statements VERSION '1.7';
+ALTER EXTENSION pg_stat_statements UPDATE TO '1.7';
 DROP EXTENSION pg_stat_statements;
 
 SET pgaudit.log_level = 'notice';
