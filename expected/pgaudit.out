@@ -1267,11 +1267,11 @@ DROP FUNCTION upper(text);
 -- levels like notice
 SET pgaudit.log = 'all,-misc_set';
 SET pgaudit.log_level = 'warning';
-CREATE EXTENSION pg_stat_statements;
-WARNING:  AUDIT: SESSION,104,1,DDL,CREATE EXTENSION,,,CREATE EXTENSION pg_stat_statements;,<none>
-ALTER EXTENSION pg_stat_statements UPDATE TO '1.7.1';
-WARNING:  AUDIT: SESSION,105,1,DDL,ALTER EXTENSION,,,ALTER EXTENSION pg_stat_statements UPDATE TO '1.7.1';,<none>
-NOTICE:  version "1.7.1" of extension "pg_stat_statements" is already installed
+CREATE EXTENSION pg_stat_statements VERSION '1.7';
+WARNING:  AUDIT: SESSION,104,1,DDL,CREATE EXTENSION,,,CREATE EXTENSION pg_stat_statements VERSION '1.7';,<none>
+ALTER EXTENSION pg_stat_statements UPDATE TO '1.7';
+WARNING:  AUDIT: SESSION,105,1,DDL,ALTER EXTENSION,,,ALTER EXTENSION pg_stat_statements UPDATE TO '1.7';,<none>
+NOTICE:  version "1.7" of extension "pg_stat_statements" is already installed
 DROP EXTENSION pg_stat_statements;
 WARNING:  AUDIT: SESSION,106,1,DDL,DROP EXTENSION,,,DROP EXTENSION pg_stat_statements;,<none>
 SET pgaudit.log_level = 'notice';
