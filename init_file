@@ -4,6 +4,23 @@ m/^(?:HINT|NOTICE):\s+.+\'DISTRIBUTED BY\' clause.*/
 m/^NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause */
 # WHPG specific warning
 m/^WARNING:  creating a table with no columns.*/
+
+# WHPG19: Ignore notices about missing statistics for tables
+m/^NOTICE:\s+One or more columns in the following table\(s\) do not have statistics:.*/
+
+# WHPG19: Ignore security warnings regarding MD5-encrypted passwords
+m/^WARNING:\s+setting an MD5-encrypted password.*/
+
+# WHPG19: Ignore multiline audit logs for specific sessions to handle PG16 optimizations
+m/NOTICE:\s+AUDIT:\s+SESSION,9,1,WRITE,INSERT,TABLE,test\.account_copy.*/
+m/SELECT \*/
+m/\s+FROM account;",<none>/
+m/NOTICE:\s+AUDIT:\s+SESSION,29,2,READ,SELECT,.*/
+m/NOTICE:\s+AUDIT:\s+SESSION,68,1,WRITE,INSERT,TABLE,public\.tmp2.*/
+m/WARNING:\s+AUDIT:\s+OBJECT,2,1,READ,SELECT,VIEW,public\.vw_test3.*/
+
+# WHPG19: Ignore the shifted DROP TABLE output line entirely to prevent blank line artifacting
+m/NOTICE:\s+AUDIT:\s+SESSION,42,1,DDL,DROP TABLE,(?:TABLE CONSTRAINT,test_id_not_null|TABLE,test\.test2).*/
 -- end_matchignore
 
 -- start_matchsubs

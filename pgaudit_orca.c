@@ -59,6 +59,9 @@
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
 #include "optimizer/planner.h"
+#if PG_VERSION_NUM >= 160000
+#include "parser/parse_relation.h"	/* getRTEPermissionInfo (PG16+) */
+#endif
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/guc.h"
@@ -76,30 +79,67 @@ typedef struct ContextEntry
     ContextType type;
     /* Captured during planning-time perm check. Will be NULL for execution
      * stage */
-    List *captured_rtable;
+    List *captured;
 } ContextEntry;
 
 /* Cache for range tables before QueryToDXL, keyed by the PlannedStmt.rtable
  * content hash */
 typedef struct RTableCacheEntry
 {
-    uint32 hash_key; /* hash of rtable content */
+	uint32 hash_key; /* hash of rtable content */
     List *rtable;    /* copy of the augmented rtable */
+#if PG_VERSION_NUM >= 160000
+	List *perminfos;
+#endif
 } RTableCacheEntry;
 
-static inline uint32 compute_rtable_hash(List *rtable);
+/*
+ * One captured relation seen during a planning-time permission check.  Holds
+ * identity/kind from the RTE and access bits/columns from its perminfo.  This
+ * version independent form is rebuilt into the layout the running executor
+ * expects (see build_cached_lists).
+ */
+typedef struct CapturedPerm
+{
+	Oid	relid;
+	char relkind;
+	RTEKind	rtekind;
+	AclMode	requiredPerms;
+	Bitmapset *selectedCols;
+	Bitmapset *insertedCols;
+	Bitmapset *updatedCols;
+} CapturedPerm;
+
+/* Extra ", List **out_perminfos" out parameter, present only on PG16+. */
+#if PG_VERSION_NUM >= 160000
+#define PGA_PERMINFOS_OUTPARAM	, List **out_perminfos
+#else
+#define PGA_PERMINFOS_OUTPARAM
+#endif
+
+static inline uint32 compute_rtable_hash(List *list);
 static inline void push_context(ContextType type);
 static inline ContextEntry *pop_context(void);
 static inline ContextEntry *top_context(void);
 static void rtable_cache_reset(void *arg);
 static void init_rtable_cache(void);
-static void cache_rtable(uint32 hash_key, List *rtable);
-static inline List *lookup_rtable(uint32 hash_key);
-static inline RangeTblEntry *copy_rte(RangeTblEntry *src);
-static inline RangeTblEntry *find_rte_by_relid(List *rtable, Oid relid);
-static inline List *merge_rtable(List *captured, List *new_rtable);
+static inline RTableCacheEntry *lookup_entry(uint32 hash_key);
+
+static void cache_rtable(uint32 hash_key, List *rtable PGA_PERMINFOS_PARAM);
+static List *merge_perms(List *captured, List *rtable PGA_PERMINFOS_PARAM);
+static void build_cached_lists(List *captured, List **out_rtable
+							   PGA_PERMINFOS_OUTPARAM);
+#if PG_VERSION_NUM >= 190000
+static PlannedStmt *pgaudit_orca_planner_hook(Query *parse,
+											  const char *query_string,
+											  int cursorOptions,
+											  ParamListInfo boundParams,
+											  ExplainState *es);
+#else
 static PlannedStmt *pgaudit_orca_planner_hook(Query *parse, int cursorOptions,
-                                              ParamListInfo boundParams);
+											  ParamListInfo boundParams);
+#endif
+
 static void pgaudit_orca_executor_start_hook(QueryDesc *queryDesc, int eflags);
 
 static List *context_stack = NIL;
@@ -121,37 +161,42 @@ static MemoryContextCallback rtable_cache_callback = {
  * when planner creates the PlannedStmt, or be used by the executor.
  */
 static inline uint32
-compute_rtable_hash(List *rtable)
+compute_rtable_hash(List *list)
 {
-    uint32 hash = list_length(rtable);
-    ListCell *lc;
+	uint32		hash = list_length(list);
+	ListCell   *lc;
 
-    foreach (lc, rtable)
-    {
-        RangeTblEntry *rte = lfirst(lc);
+	foreach(lc, list)
+	{
+		PgaPermInfo *pi = (PgaPermInfo *) lfirst(lc);
 
-        if (rte->rtekind == RTE_RELATION)
-        {
-            hash = hash * 31 + rte->relid;
-            hash = hash * 31 + rte->requiredPerms;
-        }
-    }
+#if PG_VERSION_NUM < 160000
+		/* Pre-PG16 hashes the range table; skip non-relation RTEs. */
+		if (pi->rtekind != RTE_RELATION)
+			continue;
+#endif
+		hash = hash * 31 + (uint32) pi->relid;
+		hash = hash * 31 + (uint32) pi->requiredPerms;
+	}
 
-    return hash;
+	return hash;
 }
 
 static inline void
 push_context(ContextType type)
 {
-    if (rtable_cache_context == NULL)
-        return;
+	MemoryContext oldcxt;
+	ContextEntry *entry;
 
-    MemoryContext oldcxt = MemoryContextSwitchTo(rtable_cache_context);
-    ContextEntry *entry = palloc(sizeof(ContextEntry));
-    entry->type = type;
-    entry->captured_rtable = NIL;
-    context_stack = lcons(entry, context_stack);
-    MemoryContextSwitchTo(oldcxt);
+	if (rtable_cache_context == NULL)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(rtable_cache_context);
+	entry = palloc(sizeof(ContextEntry));
+	entry->type = type;
+	entry->captured = NIL;
+	context_stack = lcons(entry, context_stack);
+	MemoryContextSwitchTo(oldcxt);
 }
 
 static inline ContextEntry *
@@ -212,193 +257,274 @@ init_rtable_cache(void)
 }
 
 /*
- * Cache the rtable keyed by content hash.
- * The rtable must already be allocated in rtable_cache_context.
+ * Look up (and remove) a cached entry by hash. Removing is fine: the entry is
+ * consumed once per execution. On a hash collision a later audit event may
+ * miss the richer data, which is not critical.
+ */
+static inline RTableCacheEntry *
+lookup_entry(uint32 hash_key)
+{
+	RTableCacheEntry *entry;
+
+	if (hash_key == 0 || rtable_cache == NULL)
+		return NULL;
+
+	entry = hash_search(rtable_cache, &hash_key, HASH_REMOVE, NULL);
+	if (entry != NULL)
+		elog(DEBUG1, "pgaudit: lookup_entry FOUND hash=%u entries=%d",
+			 hash_key, list_length(entry->rtable));
+	else
+		elog(DEBUG1, "pgaudit: lookup_entry NOT FOUND hash=%u", hash_key);
+
+	return entry;
+}
+
+/*
+ * Capture/merge helpers.
+ *
+ * Permission data is always gathered into the version independent CapturedPerm
+ * set during planning, then rebuilt into the layout the executor expects.  The
+ * PGA_* adapters (see pgaudit_orca.h) hide the PG16 perminfo split so a single
+ * implementation serves both WHPG 7 and WHPG 19.
  */
 static void
-cache_rtable(uint32 hash_key, List *rtable)
+cache_rtable(uint32 hash_key, List *rtable PGA_PERMINFOS_PARAM)
 {
-    RTableCacheEntry *entry;
-    bool found;
+	RTableCacheEntry *entry;
+	bool		found;
 
-    Assert(rtable_cache_context);
+	Assert(rtable_cache_context);
 
-    if (hash_key == 0 || rtable == NULL)
-        return;
+	if (hash_key == 0 || rtable == NULL)
+		return;
 
-    entry = hash_search(rtable_cache, &hash_key, HASH_ENTER, &found);
-    if (!found)
-    {
-        entry->hash_key = hash_key;
-        entry->rtable = rtable;
-        elog(DEBUG1, "pgaudit: cache_rtable STORED hash=%u entries=%d",
-             hash_key, list_length(rtable));
-    }
-    else
-    {
-        elog(DEBUG1, "pgaudit: cache_rtable EXISTS hash=%u", hash_key);
-    }
+	entry = hash_search(rtable_cache, &hash_key, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->hash_key = hash_key;
+		entry->rtable = rtable;
+#if PG_VERSION_NUM >= 160000
+		entry->perminfos = rtePermInfos;
+#endif
+		elog(DEBUG1, "pgaudit: cache_rtable STORED hash=%u entries=%d",
+			 hash_key, list_length(rtable));
+	}
+}
+
+static inline CapturedPerm *
+find_captured_by_relid(List *captured, Oid relid)
+{
+	ListCell   *lc;
+
+	foreach(lc, captured)
+	{
+		CapturedPerm *cp = (CapturedPerm *) lfirst(lc);
+
+		if (cp->relid == relid)
+			return cp;
+	}
+	return NULL;
 }
 
 /*
- * Look up cached rtable by hash.
+ * Merge the relations of one permission check into the captured set. Only
+ * relations carrying required permissions are kept. The perm fields are read
+ * through PGA_GET_PERMINFO so the same code serves both layouts. Caller must
+ * run this in rtable_cache_context.
  */
-static inline List *
-lookup_rtable(uint32 hash_key)
+static List *
+merge_perms(List *captured, List *rtable PGA_PERMINFOS_PARAM)
 {
-    RTableCacheEntry *entry;
+	ListCell   *lc;
 
-    if (hash_key == 0 || rtable_cache == NULL)
-    {
-        elog(DEBUG1, "pgaudit: lookup_rtable hash=%u cache=%s", hash_key,
-             rtable_cache ? "exists" : "NULL");
-        return NULL;
-    }
+	foreach(lc, rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		PgaPermInfo *pi;
+		CapturedPerm *existing;
 
-    /* Find and remove the cache entry. It should not be needed anymore.
-     * If we are unlucky and there is a hash collision, the next audit event
-     * may not have full information, which is not a critical issue. */
-    entry = hash_search(rtable_cache, &hash_key, HASH_REMOVE, NULL);
-    if (entry != NULL)
-    {
-        elog(DEBUG1, "pgaudit: lookup_rtable FOUND hash=%u entries=%d",
-             hash_key, list_length(entry->rtable));
-        return entry->rtable;
-    }
+		if (rte->rtekind != RTE_RELATION)
+			continue;
 
-    elog(DEBUG1, "pgaudit: lookup_rtable NOT FOUND hash=%u", hash_key);
-    return NULL;
+		pi = PGA_GET_PERMINFO(rte, rtePermInfos);
+		if (pi == NULL || pi->requiredPerms == 0)
+			continue;
+
+		existing = find_captured_by_relid(captured, rte->relid);
+
+		if (existing == NULL)
+		{
+			CapturedPerm *cp = (CapturedPerm *) palloc0(sizeof(CapturedPerm));
+
+			cp->relid = rte->relid;
+			cp->relkind = rte->relkind;
+			cp->rtekind = rte->rtekind;
+			cp->requiredPerms = pi->requiredPerms;
+			cp->selectedCols = bms_copy(pi->selectedCols);
+			cp->insertedCols = bms_copy(pi->insertedCols);
+			cp->updatedCols = bms_copy(pi->updatedCols);
+			captured = lappend(captured, cp);
+		}
+		else
+		{
+			existing->requiredPerms |= pi->requiredPerms;
+			if (pi->selectedCols)
+				existing->selectedCols =
+					bms_union(existing->selectedCols, pi->selectedCols);
+			if (pi->insertedCols)
+				existing->insertedCols =
+					bms_union(existing->insertedCols, pi->insertedCols);
+			if (pi->updatedCols)
+				existing->updatedCols =
+					bms_union(existing->updatedCols, pi->updatedCols);
+		}
+	}
+
+	return captured;
 }
 
 /*
- * Copy only the RTE fields that pgaudit needs for audit logging.
- * copyObject() does a deep copy and we don't need most of the fields.
+ * Rebuild a thin range table from the captured set so the executor can consume
+ * it. On PG16+ the perm fields go into a matching perminfo list linked by
+ * perminfoindex; before PG16 they live directly on the rebuilt RTEs. Caller
+ * runs this in rtable_cache_context.
  */
-static inline RangeTblEntry *
-copy_rte(RangeTblEntry *src)
+static void
+build_cached_lists(List *captured, List **out_rtable PGA_PERMINFOS_OUTPARAM)
 {
-    RangeTblEntry *dst = makeNode(RangeTblEntry);
+	List	   *rtable = NIL;
+#if PG_VERSION_NUM >= 160000
+	List	   *perminfos = NIL;
+	int			idx = 0;
+#endif
+	ListCell   *lc;
 
-    dst->rtekind = src->rtekind;
-    dst->relid = src->relid;
-    dst->relkind = src->relkind;
-    dst->requiredPerms = src->requiredPerms;
-    dst->selectedCols = bms_copy(src->selectedCols);
-    dst->insertedCols = bms_copy(src->insertedCols);
-    dst->updatedCols = bms_copy(src->updatedCols);
+	foreach(lc, captured)
+	{
+		CapturedPerm *cp = (CapturedPerm *) lfirst(lc);
+		RangeTblEntry *rte = makeNode(RangeTblEntry);
 
-    return dst;
-}
+		rte->rtekind = cp->rtekind;
+		rte->relid = cp->relid;
+		rte->relkind = cp->relkind;
 
-static inline RangeTblEntry *
-find_rte_by_relid(List *rtable, Oid relid)
-{
-    ListCell *lc;
+#if PG_VERSION_NUM >= 160000
+		{
+			RTEPermissionInfo *pi = makeNode(RTEPermissionInfo);
 
-    foreach (lc, rtable)
-    {
-        RangeTblEntry *rte = lfirst(lc);
-        if (rte->relid == relid)
-            return rte;
-    }
-    return NULL;
-}
+			rte->perminfoindex = ++idx;		/* 1-based index into perminfos */
 
-/*
- * Merge RTEs from new rtable into existing captured rtable.
- * Only adds RTEs with requiredPerms > 0.
- * Returns merged list (may be newly created or the original).
- */
-static inline List *
-merge_rtable(List *captured, List *new_rtable)
-{
-    ListCell *lc;
+			pi->relid = cp->relid;
+			pi->inh = false;
+			pi->requiredPerms = cp->requiredPerms;
+			pi->checkAsUser = InvalidOid;
+			pi->selectedCols = cp->selectedCols;
+			pi->insertedCols = cp->insertedCols;
+			pi->updatedCols = cp->updatedCols;
+			perminfos = lappend(perminfos, pi);
+		}
+#else
+		rte->requiredPerms = cp->requiredPerms;
+		rte->selectedCols = cp->selectedCols;
+		rte->insertedCols = cp->insertedCols;
+		rte->updatedCols = cp->updatedCols;
+#endif
 
-    foreach (lc, new_rtable)
-    {
-        RangeTblEntry *new_rte = lfirst(lc);
+		rtable = lappend(rtable, rte);
+	}
 
-        /* Only interested in relations with permissions to check */
-        if (new_rte->rtekind != RTE_RELATION || new_rte->requiredPerms == 0)
-            continue;
-
-        /* Check if we already have this relation */
-        RangeTblEntry *existing = find_rte_by_relid(captured, new_rte->relid);
-
-        if (existing == NULL)
-        {
-            /* New relation - copy and add it */
-            RangeTblEntry *copy = copy_rte(new_rte);
-            captured = lappend(captured, copy);
-        }
-        else
-        {
-            /* Existing relation - merge permissions */
-            existing->requiredPerms |= new_rte->requiredPerms;
-            /* Also merge column bitmaps if available */
-            if (new_rte->selectedCols)
-                existing->selectedCols =
-                    bms_union(existing->selectedCols, new_rte->selectedCols);
-            if (new_rte->insertedCols)
-                existing->insertedCols =
-                    bms_union(existing->insertedCols, new_rte->insertedCols);
-            if (new_rte->updatedCols)
-                existing->updatedCols =
-                    bms_union(existing->updatedCols, new_rte->updatedCols);
-        }
-    }
-
-    return captured;
+	*out_rtable = rtable;
+#if PG_VERSION_NUM >= 160000
+	*out_perminfos = perminfos;
+#endif
 }
 
 /*
- * Planner hook - push PLANNER context, cache rtable on exit.
+* Planner hook - push PLANNER context, cache rtable on exit.
+*/
+#if PG_VERSION_NUM >= 190000
+#define PGAUDIT_DO_PLAN(fn) \
+	(fn)(parse, query_string, cursorOptions, boundParams, es)
+#else
+#define PGAUDIT_DO_PLAN(fn) \
+	(fn)(parse, cursorOptions, boundParams)
+#endif
+
+/*
+ * Planner hook - push PLANNER context, cache captured perms on exit.
  */
 static PlannedStmt *
+#if PG_VERSION_NUM >= 190000
+pgaudit_orca_planner_hook(Query *parse, const char *query_string,
+						  int cursorOptions, ParamListInfo boundParams,
+						  ExplainState *es)
+#else
 pgaudit_orca_planner_hook(Query *parse, int cursorOptions,
-                          ParamListInfo boundParams)
+						  ParamListInfo boundParams)
+#endif
 {
-    PlannedStmt *result;
-    if (!optimizer)
-    {
-        /* Do nothing if it is not orca */
-        if (prev_planner_hook)
-            result = prev_planner_hook(parse, cursorOptions, boundParams);
-        else
-            result = standard_planner(parse, cursorOptions, boundParams);
-        return result;
-    }
+	PlannedStmt *result;
+	ContextEntry *ctx;
 
-    init_rtable_cache();
-    push_context(CONTEXT_PLANNER);
+	if (!optimizer)
+	{
+		/* Do nothing if it is not orca */
+		if (prev_planner_hook)
+			result = PGAUDIT_DO_PLAN(prev_planner_hook);
+		else
+			result = PGAUDIT_DO_PLAN(standard_planner);
+		return result;
+	}
 
-    PG_TRY();
-    {
-        if (prev_planner_hook)
-            result = prev_planner_hook(parse, cursorOptions, boundParams);
-        else
-            result = standard_planner(parse, cursorOptions, boundParams);
-    }
-    PG_CATCH();
-    {
-        pop_context();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
+	init_rtable_cache();
+	push_context(CONTEXT_PLANNER);
 
-    ContextEntry *ctx = pop_context();
+	PG_TRY();
+	{
+		if (prev_planner_hook)
+			result = PGAUDIT_DO_PLAN(prev_planner_hook);
+		else
+			result = PGAUDIT_DO_PLAN(standard_planner);
+	}
+	PG_CATCH();
+	{
+		pop_context();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-    /* Cache the captured rtable if this was an ORCA plan */
-    if (ctx != NULL && ctx->captured_rtable != NIL &&
-        result->planGen == PLANGEN_OPTIMIZER)
-    {
-        uint32 hash = compute_rtable_hash(result->rtable);
-        if (hash != 0)
-            cache_rtable(hash, ctx->captured_rtable);
-        ctx->captured_rtable = NIL;
-    }
+	ctx = pop_context();
 
-    return result;
+	/* Cache the captured perms if this was an ORCA plan */
+	if (ctx != NULL && ctx->captured != NIL &&
+		result->planGen == PLANGEN_OPTIMIZER)
+	{
+		/* The hash must be computed over whatever the executor will hand us. */
+#if PG_VERSION_NUM >= 160000
+		uint32		hash = compute_rtable_hash(result->permInfos);
+#else
+		uint32		hash = compute_rtable_hash(result->rtable);
+#endif
+
+		if (hash != 0)
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(rtable_cache_context);
+			List	   *crt = NIL;
+#if PG_VERSION_NUM >= 160000
+			List	   *cpi = NIL;
+
+			build_cached_lists(ctx->captured, &crt, &cpi);
+			cache_rtable(hash, crt, cpi);
+#else
+			build_cached_lists(ctx->captured, &crt);
+			cache_rtable(hash, crt);
+#endif
+			MemoryContextSwitchTo(oldcxt);
+		}
+		ctx->captured = NIL;
+	}
+
+	return result;
 }
 
 /*
@@ -453,41 +579,51 @@ orca_in_planner(void)
 
 /*
  * Called from ExecutorCheckPerms_hook.
- * - During planning: capture and merge RTEs from all permission checks
- * - During execution: return the cached rtable
+ * - During planning: capture and merge perms from all permission checks.
+ * - During execution: hand back the cached data via the out params on a hit.
+ *
+ * The signature differs only in the perminfo list/out param that PG16+ adds;
+ * the body is shared through the PGA_* adapters.
  */
-List *
-orca_resolve_rtable(List *rtables)
+#if PG_VERSION_NUM >= 160000
+bool
+orca_resolve_rtable(List *rtables, List *rtePermInfos,
+					List **out_rtable, List **out_perminfos)
+#else
+bool
+orca_resolve_rtable(List *rtables, List **out_rtable)
+#endif
 {
-    ContextEntry *ctx;
-    uint32 hash;
+	ContextEntry *ctx = top_context();
 
-    ctx = top_context();
-    if (ctx == NULL)
-        return NULL;
+	if (ctx == NULL)
+		return false;
 
-    if (ctx->type == CONTEXT_PLANNER)
-    {
-        /*
-         * During planning: merge RTEs from this permission check into captured
-         * list. ORCA may call permission check multiple times with different
-         * RTEs, for example "SELECT * FROM some_table, someview":
-         * - First call might have TABLE and SUBQUERY with SELECT permission
-         * - Second call might extract the SUBQUERY and have VIEW and the base
-         *   table with SELECT permission
-         * We need to collect all RTEs with requiredPerms > 0.
-         *
-         * Allocate in rtable_cache_context so it survives until execution.
-         */
-        MemoryContext oldcxt = MemoryContextSwitchTo(rtable_cache_context);
-        ctx->captured_rtable = merge_rtable(ctx->captured_rtable, rtables);
-        MemoryContextSwitchTo(oldcxt);
-        return NULL; /* Don't return anything during planning */
-    }
-    else
-    {
-        /* During execution: look up cached rtable */
-        hash = compute_rtable_hash(rtables);
-        return lookup_rtable(hash);
-    }
+	if (ctx->type == CONTEXT_PLANNER)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(rtable_cache_context);
+
+		ctx->captured = merge_perms(ctx->captured, rtables PGA_PERMINFOS_ARG);
+		MemoryContextSwitchTo(oldcxt);
+		return false;			/* nothing to return during planning */
+	}
+	else
+	{
+#if PG_VERSION_NUM >= 160000
+		uint32		hash = compute_rtable_hash(rtePermInfos);
+#else
+		uint32		hash = compute_rtable_hash(rtables);
+#endif
+		RTableCacheEntry *entry = lookup_entry(hash);
+
+		if (entry != NULL)
+		{
+			*out_rtable = entry->rtable;
+#if PG_VERSION_NUM >= 160000
+			*out_perminfos = entry->perminfos;
+#endif
+			return true;
+		}
+		return false;
+	}
 }
