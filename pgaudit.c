@@ -39,11 +39,33 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#if PG_VERSION_NUM >= 160000
+#include "parser/parse_relation.h"	/* getRTEPermissionInfo */
+#endif
+#if PG_VERSION_NUM >= 130000
+#include "tcop/cmdtag.h"			/* CommandTag / GetCommandTagName */
+#endif
+
 
 /* WHPG PATCH Starts */
 #include "cdb/cdbvars.h"
 #include "pgaudit_orca.h"
 /* WHPG PATCH Ends */
+
+/*
+ * GUC allocation compatibility.
+ *
+ * PG16 moved GUC memory into a dedicated context: a check hook's *extra must be
+ * allocated with guc_malloc() and released with guc_free(),
+ * because the GUC machinery frees extra with guc_free().
+ */
+#if PG_VERSION_NUM >= 160000
+#define pgaudit_guc_malloc(sz)	guc_malloc(ERROR, (sz))
+#define pgaudit_guc_free(p)		guc_free(p)
+#else
+#define pgaudit_guc_malloc(sz)	malloc(sz)
+#define pgaudit_guc_free(p)		free(p)
+#endif
 
 PG_MODULE_MAGIC;
 
@@ -350,7 +372,7 @@ stack_free(void *stackFree)
  * store it.
  */
 static AuditEventStackItem *
-stack_push()
+stack_push(void)
 {
     MemoryContext contextAudit;
     MemoryContext contextOld;
@@ -939,8 +961,7 @@ audit_on_any_attribute(Oid relOid,
                        AclMode mode)
 {
     bool result = false;
-    AttrNumber col;
-    Bitmapset *tmpSet;
+    int col;
 
     /* If bms is empty then check for any column match */
     if (bms_is_empty(attributeSet))
@@ -949,38 +970,31 @@ audit_on_any_attribute(Oid relOid,
         AttrNumber nattrs;
         AttrNumber curr_att;
 
-        /* Get relation to determine total columns */
         classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relOid));
-
         if (!HeapTupleIsValid(classTuple))
             return false;
 
         nattrs = ((Form_pg_class) GETSTRUCT(classTuple))->relnatts;
         ReleaseSysCache(classTuple);
 
-        /* Check each column */
         for (curr_att = 1; curr_att <= nattrs; curr_att++)
             if (audit_on_attribute(relOid, curr_att, auditOid, mode))
                 return true;
     }
 
-    /* bms_first_member is destructive, so make a copy before using it. */
-    tmpSet = bms_copy(attributeSet);
-
-    /* Check each column */
-    while ((col = bms_first_member(tmpSet)) >= 0)
+    /* Iterate the column set non-destructively (no copy needed) */
+    col = -1;
+    while ((col = bms_next_member(attributeSet, col)) >= 0)
     {
-        col += FirstLowInvalidHeapAttributeNumber;
+        AttrNumber attno = col + FirstLowInvalidHeapAttributeNumber;
 
-        if (col != InvalidAttrNumber &&
-            audit_on_attribute(relOid, col, auditOid, mode))
+        if (attno != InvalidAttrNumber &&
+            audit_on_attribute(relOid, attno, auditOid, mode))
         {
             result = true;
             break;
         }
     }
-
-    bms_free(tmpSet);
 
     return result;
 }
@@ -989,7 +1003,7 @@ audit_on_any_attribute(Oid relOid,
  * Create AuditEvents for SELECT/DML operations via executor permissions checks.
  */
 static void
-log_select_dml(Oid auditOid, List *rangeTabls)
+log_select_dml(Oid auditOid, List *rangeTabls PGA_PERMINFOS_PARAM)
 {
     ListCell *lr;
     bool first = true;
@@ -1004,13 +1018,29 @@ log_select_dml(Oid auditOid, List *rangeTabls)
         Oid relOid;
         Oid relNamespaceOid;
         RangeTblEntry *rte = lfirst(lr);
+        AclMode requiredPerms;
+        Bitmapset *selectedCols;
+        Bitmapset *insertedCols;
+        Bitmapset *updatedCols;
 
         /*
-         * We only care about tables, and can ignore subqueries etc. Also detect
-         * and skip partitions by checking for missing requiredPerms.
+         * We only care about tables, and can ignore subqueries etc. Also
+         * detect and skip partitions and relations without required perms.
+         *
+         * The permission fields are resolved through PGA_GET_PERMINFO so the
+         * same code serves both the pre-PG16 layout (perms on the RTE) and the
+         * PG16 layout (perms in a parallel RTEPermissionInfo list).
          */
-        if (rte->rtekind != RTE_RELATION || rte->requiredPerms == 0)
+        PgaPermInfo *perminfo = PGA_GET_PERMINFO(rte, rtePermInfos);
+
+        if (rte->rtekind != RTE_RELATION || perminfo == NULL ||
+            perminfo->requiredPerms == 0)
             continue;
+
+        requiredPerms = perminfo->requiredPerms;
+        selectedCols = perminfo->selectedCols;
+        insertedCols = perminfo->insertedCols;
+        updatedCols = perminfo->updatedCols;
 
         found = true;
 
@@ -1055,25 +1085,25 @@ log_select_dml(Oid auditOid, List *rangeTabls)
          * the node type, object type, and command tag by decoding
          * rte->requiredPerms and rte->relkind.
          */
-        if (rte->requiredPerms & ACL_INSERT)
+        if (requiredPerms & ACL_INSERT)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
             auditEventStack->auditEvent.commandTag = T_InsertStmt;
             auditEventStack->auditEvent.command = COMMAND_INSERT;
         }
-        else if (rte->requiredPerms & ACL_UPDATE)
+        else if (requiredPerms & ACL_UPDATE)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
             auditEventStack->auditEvent.commandTag = T_UpdateStmt;
             auditEventStack->auditEvent.command = COMMAND_UPDATE;
         }
-        else if (rte->requiredPerms & ACL_DELETE)
+        else if (requiredPerms & ACL_DELETE)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
             auditEventStack->auditEvent.commandTag = T_DeleteStmt;
             auditEventStack->auditEvent.command = COMMAND_DELETE;
         }
-        else if (rte->requiredPerms & ACL_SELECT)
+        else if (requiredPerms & ACL_SELECT)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_ALL;
             auditEventStack->auditEvent.commandTag = T_SelectStmt;
@@ -1138,7 +1168,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
         {
             AclMode auditPerms =
                 (ACL_SELECT | ACL_UPDATE | ACL_INSERT | ACL_DELETE) &
-                rte->requiredPerms;
+                requiredPerms;
 
             /*
              * If any of the required permissions for the relation are granted
@@ -1159,7 +1189,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
                 if (auditPerms & ACL_SELECT)
                     auditEventStack->auditEvent.granted =
                         audit_on_any_attribute(relOid, auditOid,
-                                               rte->selectedCols,
+                                               selectedCols,
                                                ACL_SELECT);
 
                 /*
@@ -1169,7 +1199,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
                     auditPerms & ACL_INSERT)
                     auditEventStack->auditEvent.granted =
                         audit_on_any_attribute(relOid, auditOid,
-                                               rte->insertedCols,
+                                               insertedCols,
                                                auditPerms);
 
                 /*
@@ -1179,7 +1209,7 @@ log_select_dml(Oid auditOid, List *rangeTabls)
                     auditPerms & ACL_UPDATE)
                     auditEventStack->auditEvent.granted =
                         audit_on_any_attribute(relOid, auditOid,
-                                               rte->updatedCols,
+                                               updatedCols,
                                                auditPerms);
             }
         }
@@ -1351,21 +1381,32 @@ pgaudit_ExecutorStart_hook(QueryDesc *queryDesc, int eflags)
  * Hook ExecutorCheckPerms to do session and object auditing for DML.
  */
 static bool
-pgaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
+pgaudit_ExecutorCheckPerms_hook(List *rangeTabls PGA_PERMINFOS_PARAM, bool abort)
 {
     Oid auditOid;
 
 /* WHPG PATCH Starts */
     /*
-     * ORCA compatibility: capture rtable during planning, use cached during execution.
-     * orca_resolve_rtable() handles both cases:
-     * - During planning: captures rangeTabls, returns NULL
-     * - During execution: returns cached rtable if found
+     * ORCA compatibility: capture rtable during planning, use cached during
+     * execution.  orca_resolve_rtable() handles both cases:
+     * - During planning: captures rangeTabls, returns false
+     * - During execution: returns true and the cached data on a hit
      */
     {
-        List *cached_rtable = orca_resolve_rtable(rangeTabls);
-        if (cached_rtable != NULL)
+        List *cached_rtable = NIL;
+#if PG_VERSION_NUM >= 160000
+        List *cached_perminfos = NIL;
+
+        if (orca_resolve_rtable(rangeTabls, rtePermInfos,
+                                &cached_rtable, &cached_perminfos))
+        {
             rangeTabls = cached_rtable;
+            rtePermInfos = cached_perminfos;
+        }
+#else
+        if (orca_resolve_rtable(rangeTabls, &cached_rtable))
+            rangeTabls = cached_rtable;
+#endif
     }
 
     /*
@@ -1377,7 +1418,7 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
     if (orca_in_planner() || !auditEventStack)
     {
         if (next_ExecutorCheckPerms_hook &&
-            !(*next_ExecutorCheckPerms_hook) (rangeTabls, abort))
+            !(*next_ExecutorCheckPerms_hook) (rangeTabls PGA_PERMINFOS_ARG, abort))
             return false;
         return true;
     }
@@ -1389,11 +1430,11 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
     /* Log DML if the audit role is valid or session logging is enabled */
     if ((auditOid != InvalidOid || auditLogBitmap != 0) &&
         !IsAbortedTransactionBlockState())
-        log_select_dml(auditOid, rangeTabls);
+        log_select_dml(auditOid, rangeTabls PGA_PERMINFOS_ARG);
 
     /* Call the next hook function */
     if (next_ExecutorCheckPerms_hook &&
-        !(*next_ExecutorCheckPerms_hook) (rangeTabls, abort))
+        !(*next_ExecutorCheckPerms_hook) (rangeTabls PGA_PERMINFOS_ARG, abort))
         return false;
 
     return true;
@@ -1403,6 +1444,16 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
  * Hook ProcessUtility to do session auditing for DDL and utility commands.
  */
 static void
+#if PG_VERSION_NUM >= 140000
+pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
+                            const char *queryString,
+                            bool readOnlyTree,
+                            ProcessUtilityContext context,
+                            ParamListInfo params,
+                            QueryEnvironment *queryEnv,
+                            DestReceiver *dest,
+                            QueryCompletion *qc)
+#else
 pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
                             const char *queryString,
                             ProcessUtilityContext context,
@@ -1410,6 +1461,7 @@ pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
                             QueryEnvironment *queryEnv,
                             DestReceiver *dest,
                             char *completionTag)
+#endif
 {
     AuditEventStackItem *stackItem = NULL;
     int64 stackId = 0;
@@ -1454,7 +1506,11 @@ pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
         stackId = stackItem->stackId;
         stackItem->auditEvent.logStmtLevel = GetCommandLogLevel(pstmt->utilityStmt);
         stackItem->auditEvent.commandTag = nodeTag(pstmt->utilityStmt);
+#if PG_VERSION_NUM >= 130000
+        stackItem->auditEvent.command = GetCommandTagName(CreateCommandTag(pstmt->utilityStmt));
+#else
         stackItem->auditEvent.command = CreateCommandTag(pstmt->utilityStmt);
+#endif
         stackItem->auditEvent.commandText = queryString;
 
         /*
@@ -1493,12 +1549,21 @@ pgaudit_ProcessUtility_hook(PlannedStmt *pstmt,
     }
 
     /* Call the standard process utility chain. */
+#if PG_VERSION_NUM >= 140000
     if (next_ProcessUtility_hook)
-        (*next_ProcessUtility_hook) (pstmt, queryString, context, params,
-                                     queryEnv, dest, completionTag);
+        (*next_ProcessUtility_hook) (pstmt, queryString, readOnlyTree, context,
+                                     params, queryEnv, dest, qc);
     else
-        standard_ProcessUtility(pstmt, queryString, context, params,
-                                queryEnv, dest, completionTag);
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                params, queryEnv, dest, qc);
+#else
+    if (next_ProcessUtility_hook)
+        (*next_ProcessUtility_hook) (pstmt, queryString, context,
+                                     params, queryEnv, dest, completionTag);
+    else
+        standard_ProcessUtility(pstmt, queryString, context,
+                                params, queryEnv, dest, completionTag);
+#endif
 
     /*
      * Process the audit event if there is one.  Also check that this event
@@ -1593,8 +1658,13 @@ pgaudit_ddl_command_end(PG_FUNCTION_ARGS)
         GetCommandLogLevel(eventData->parsetree);
     auditEventStack->auditEvent.commandTag =
         nodeTag(eventData->parsetree);
+#if PG_VERSION_NUM >= 130000
+    auditEventStack->auditEvent.command =
+        GetCommandTagName(CreateCommandTag(eventData->parsetree));
+#else
     auditEventStack->auditEvent.command =
         CreateCommandTag(eventData->parsetree);
+#endif
 
     /* Return objects affected by the (non drop) DDL statement */
     query = "SELECT pg_catalog.upper(object_type),\n"
@@ -1776,7 +1846,7 @@ check_pgaudit_log(char **newVal, void **extra, GucSource source)
      * Check that we recognise each token, and add it to the bitmap we're
      * building up in a newly-allocated int *f.
      */
-    if (!(flags = (int *) malloc(sizeof(int))))
+    if (!(flags = (int *) pgaudit_guc_malloc(sizeof(int))))
         return false;
 
     *flags = 0;
@@ -1815,7 +1885,7 @@ check_pgaudit_log(char **newVal, void **extra, GucSource source)
             class = LOG_WRITE;
         else
         {
-            free(flags);
+            pgaudit_guc_free(flags);
             pfree(rawVal);
             list_free(flagRawList);
             return false;
@@ -1860,7 +1930,7 @@ check_pgaudit_log_level(char **newVal, void **extra, GucSource source)
     int *logLevel;
 
     /* Allocate memory to store the log level */
-    if (!(logLevel = (int *) malloc(sizeof(int))))
+    if (!(logLevel = (int *) pgaudit_guc_malloc(sizeof(int))))
         return false;
 
     /* Find the log level enum */
@@ -1888,7 +1958,7 @@ check_pgaudit_log_level(char **newVal, void **extra, GucSource source)
     /* Error if the log level enum is not found */
     else
     {
-        free(logLevel);
+        pgaudit_guc_free(logLevel);
         return false;
     }
 
