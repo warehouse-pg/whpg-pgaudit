@@ -1,3 +1,60 @@
+# WarehousePG pgAudit
+
+## Introduction
+
+pgAudit provides detailed session and object audit logging through the
+standard logging facility, for the audit trails that government, financial
+and ISO certifications often require.
+
+This repository is a fork of the open-source pgAudit project
+(github.com/pgaudit/pgaudit), maintained for WarehousePG. The `WHPG_6` branch
+is based on pgAudit 1.0.9 and builds for WarehousePG 6; WarehousePG 7 and 19
+are on the `WHPG_7` branch. The WarehousePG changes on top adapt it to
+WarehousePG, including auditing of statements planned by GPORCA and a port of
+the DDL object auditing to PostgreSQL 9.4. The `main` branch tracks upstream
+pgAudit.
+
+## Building and Testing
+
+With the WarehousePG `pg_config` on your `PATH`:
+
+```
+make USE_PGXS=1
+make USE_PGXS=1 install    # may need root to write into $GPHOME
+```
+
+The regression suite needs a running WarehousePG cluster set up the way the
+packaging smoke test sets it up:
+
+* `pgaudit` in `shared_preload_libraries`
+  (`gpconfig -c shared_preload_libraries -v 'pgaudit'`, then `gpstop -ar`)
+* a `local all all trust` line in the master's `pg_hba.conf`, since the
+  test reconnects as the roles it creates
+
+Then run it with both planners:
+
+```
+PGOPTIONS='-c optimizer=off' make USE_PGXS=1 installcheck
+PGOPTIONS='-c optimizer=on' make USE_PGXS=1 installcheck
+```
+
+Then load the extension with `CREATE EXTENSION pgaudit;`.
+
+The upstream pgAudit documentation is kept below; its version compatibility
+table and install instructions refer to PostgreSQL, not to WarehousePG.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE-OF-CONDUCT.md). To report a security issue, see
+[SECURITY.md](SECURITY.md).
+
+## License
+
+PostgreSQL License. See [LICENSE.md](LICENSE.md).
+
+---
+
 # pgAudit <br/> Open Source PostgreSQL Audit Logging
 
 ## Introduction
