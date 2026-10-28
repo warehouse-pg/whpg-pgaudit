@@ -1,3 +1,82 @@
+# WarehousePG pgAudit
+
+## Introduction
+
+pgAudit provides detailed session and object audit logging through the
+standard logging facility, for the audit trails that government, financial
+and ISO certifications often require.
+
+This repository is a fork of the open-source pgAudit project
+(github.com/pgaudit/pgaudit), maintained for WarehousePG. The `WHPG_19` branch
+is based on pgAudit 19.0 and builds for WarehousePG 19. The `WHPG_7` branch
+is based on pgAudit 1.4.3; WarehousePG 6 is on the `WHPG_6` branch. The
+WarehousePG changes on top adapt it to
+WarehousePG, including auditing of statements planned by GPORCA. The `main`
+branch tracks upstream pgAudit.
+
+## Building and Testing
+
+With the WarehousePG `pg_config` on your `PATH`:
+
+```
+make USE_PGXS=1
+make USE_PGXS=1 install    # may need root to write into $GPHOME
+```
+
+The regression suite needs a running WarehousePG cluster set up the way the
+packaging smoke test sets it up:
+
+* `pgaudit` in `shared_preload_libraries`
+  (`gpconfig -c shared_preload_libraries -v 'pgaudit'`, then `gpstop -ar`)
+* the `pg_stat_statements` and `postgres_fdw` contrib modules installed
+* a `local all all trust` line in the coordinator's `pg_hba.conf`, since the
+  test reconnects as the roles it creates
+
+The expected output was produced on a demo cluster with three segments.
+
+Then run it with both planners:
+
+```
+PGOPTIONS='-c optimizer=off' make USE_PGXS=1 installcheck
+PGOPTIONS='-c optimizer=on' make USE_PGXS=1 installcheck
+```
+
+`make installcheck` also runs the TAP tests under `t/` when WarehousePG was
+built with TAP tests. They need `prove` and the Perl modules `Test::More` and
+`IPC::Run` (on EL9: `perl-Test-Harness`, `perl-Test-Simple`, `perl-IPC-Run`).
+They start their own nodes and do not use the cluster.
+
+Then load the extension with `CREATE EXTENSION pgaudit;`.
+
+The upstream pgAudit documentation is kept below; its version compatibility
+table and install instructions refer to PostgreSQL, not to WarehousePG.
+
+## Upgrading from pgAudit 1.4.3
+
+There is no update script from 1.4.3, the version on the `WHPG_7` branch, so
+`ALTER EXTENSION pgaudit UPDATE` fails. After installing this version,
+recreate the extension in each database that has it:
+
+```
+DROP EXTENSION pgaudit;
+CREATE EXTENSION pgaudit;
+```
+
+The extension holds only its two event triggers and their functions, so no
+data is lost.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE-OF-CONDUCT.md). To report a security issue, see
+[SECURITY.md](SECURITY.md).
+
+## License
+
+PostgreSQL License. See [LICENSE.md](LICENSE.md).
+
+---
+
 # pgAudit <br/> Open Source PostgreSQL Audit Logging
 
 ## Introduction
