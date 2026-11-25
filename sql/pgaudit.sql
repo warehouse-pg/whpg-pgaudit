@@ -189,14 +189,17 @@ SELECT id
 --
 -- Object logged because of:
 -- insert on test3
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
 
 DO $$ BEGIN PERFORM test2_change(91); END $$;
 
@@ -204,32 +207,39 @@ DO $$ BEGIN PERFORM test2_change(91); END $$;
 -- Object logged because of:
 -- insert on test3
 -- update on test2
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+SELECT 1;
 
 --
 -- Object logged because of:
 -- insert on test2
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
 
 --
 -- Be sure that test has correct contents
+-- WHPG: test2 is empty, the writable CTEs above do not run in WarehousePG.
 SELECT *
   FROM test2
  ORDER BY ID;
@@ -648,6 +658,8 @@ CREATE TABLE public.test
 
 --
 -- Check that analyze is logged
+-- WHPG: the coordinator samples the segments with gp_acquire_sample_rows(),
+-- which is logged.
 ANALYZE test;
 
 --
@@ -691,6 +703,7 @@ INSERT INTO TEST (id)
 INSERT INTO TEST (id)
 		  VALUES (3);
 
+-- WHPG: ORDER BY in the loop query, rows of a distributed table come in any order.
 DO $$
 DECLARE
 	result RECORD;
@@ -698,6 +711,7 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
@@ -900,6 +914,8 @@ GRANT UPDATE
 INSERT INTO aaa VALUES (generate_series(1,100));
 
 SET pgaudit.log_parameter TO OFF;
+-- WHPG: the trigger on bbb runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the insert fails.
 INSERT INTO bbb VALUES (1);
 SET pgaudit.log_parameter TO ON;
 
@@ -972,8 +988,10 @@ COPY h FROM stdin;
 2	2
 3	3
 \.
+-- WHPG: the rows come back segment by segment, not in insert order.
 COPY h TO stdout;
-COPY (SELECT * FROM h) TO stdout;
+-- WHPG: ORDER BY, rows of a distributed table come in any order.
+COPY (SELECT * FROM h ORDER BY x) TO stdout;
 CREATE INDEX h_idx ON h (x);
 DROP INDEX h_idx;
 DROP TABLE h;
@@ -988,6 +1006,8 @@ CREATE TABLE fk_pk (id int PRIMARY KEY);
 INSERT INTO fk_pk VALUES (1);
 CREATE TABLE fk_fk (id int);
 INSERT INTO fk_fk VALUES (1);
+-- WHPG: WarehousePG does not enforce foreign keys, so no validation query is
+-- run or logged.
 ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey FOREIGN KEY (id) REFERENCES fk_pk(id);
 ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey_nv FOREIGN KEY (id) REFERENCES fk_pk(id) NOT VALID;
 ALTER TABLE fk_fk VALIDATE CONSTRAINT fk_fk_id_fkey_nv;
@@ -1000,6 +1020,8 @@ DROP TABLE fk_pk;
 -- trigger, which runs after the statement's own check or, when the constraint
 -- is deferred, at COMMIT.  A top-level COMMIT runs with the stack empty, while
 -- one made by a procedure or DO block runs with the CALL or DO on top.
+-- WHPG: WarehousePG creates foreign key triggers disabled, so no FK check runs
+-- and this block does not reach the RI fast path.
 CREATE TABLE ri_pk (id int PRIMARY KEY);
 CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE);
 INSERT INTO ri_pk VALUES (1), (2);
@@ -1089,6 +1111,8 @@ SELECT *
 
 --
 -- Test DML
+-- WHPG: the trigger on test2 runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the inserts into test2 fail and test2 stays empty.
 INSERT INTO test2 (id, name)
 		  VALUES (1, 'a');
 INSERT INTO test2 (id, name)
@@ -1128,46 +1152,50 @@ SELECT 1
 	  LIMIT 3
 ) SUBQUERY;
 
-WITH CTE AS
-(
-	SELECT id
-	  FROM test2
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
+-- WHPG: on one line, so that each audit entry is one line and the two entries
+-- compare in any order. GPORCA logs the table of the CTE first.
+WITH CTE AS (SELECT id FROM test2) INSERT INTO test3 SELECT id FROM cte;
 
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
 
 DO $$ BEGIN PERFORM test2_change(91); END $$;
 
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+SELECT 1;
 
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
 
 DELETE
   FROM test2;
@@ -1293,6 +1321,9 @@ DROP TABLE test.account_copy;
 
 --
 -- Create a table from a query
+-- WHPG: the SELECT entries report 0 rows, the coordinator gets the
+-- row count of CREATE TABLE AS only in ExecutorEnd. Accepted output until
+-- the server provides it earlier.
 CREATE TABLE test.account_copy AS
 SELECT *
   FROM account;
@@ -1394,6 +1425,8 @@ CREATE TABLE public.test
 
 --
 -- Check that analyze is logged
+-- WHPG: the coordinator samples the segments with gp_acquire_sample_rows(),
+-- which is logged.
 ANALYZE test;
 
 --
@@ -1433,6 +1466,7 @@ INSERT INTO TEST (id)
 INSERT INTO TEST (id)
 		  VALUES (3);
 
+-- WHPG: ORDER BY in the loop query, rows of a distributed table come in any order.
 DO $$
 DECLARE
 	result RECORD;
@@ -1440,6 +1474,7 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
@@ -1636,6 +1671,8 @@ GRANT UPDATE
 INSERT INTO aaa VALUES (generate_series(1,100));
 
 SET pgaudit.log_parameter TO OFF;
+-- WHPG: the trigger on bbb runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the insert fails.
 INSERT INTO bbb VALUES (1);
 SET pgaudit.log_parameter TO ON;
 
@@ -1697,8 +1734,10 @@ COPY h FROM stdin;
 2	2
 3	3
 \.
+-- WHPG: the rows come back segment by segment, not in insert order.
 COPY h TO stdout;
-COPY (SELECT * FROM h) TO stdout;
+-- WHPG: ORDER BY, rows of a distributed table come in any order.
+COPY (SELECT * FROM h ORDER BY x) TO stdout;
 CREATE INDEX h_idx ON h (x);
 DROP INDEX h_idx;
 DROP TABLE h;
@@ -1709,6 +1748,8 @@ DROP TABLE h;
 -- trigger, which runs after the statement's own check or, when the constraint
 -- is deferred, at SET CONSTRAINTS ... IMMEDIATE or COMMIT, including a COMMIT
 -- made by a procedure or DO block.
+-- WHPG: WarehousePG creates foreign key triggers disabled, so no FK check runs
+-- and this block does not reach the RI fast path.
 CREATE TABLE ri_pk (id int PRIMARY KEY);
 CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE);
 INSERT INTO ri_pk VALUES (1), (2);
@@ -1818,7 +1859,8 @@ SET pgaudit.log = 'all,-misc_set';
 SET pgaudit.log_level = 'warning';
 
 CREATE EXTENSION pg_stat_statements;
-ALTER EXTENSION pg_stat_statements UPDATE TO '1.13';
+-- WHPG: WarehousePG ships pg_stat_statements 1.13.1.
+ALTER EXTENSION pg_stat_statements UPDATE TO '1.13.1';
 DROP EXTENSION pg_stat_statements;
 
 SET pgaudit.log_level = 'notice';

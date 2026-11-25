@@ -227,23 +227,23 @@ WARNING:  AUDIT: OBJECT,3,1,READ,SELECT,TABLE,public.test2,<previously logged>,<
 --
 -- Object logged because of:
 -- insert on test3
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
-WARNING:  AUDIT: SESSION,4,1,WRITE,INSERT,,,"WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte",<not logged>
-WARNING:  AUDIT: OBJECT,4,1,WRITE,INSERT,TABLE,public.test3,<previously logged>,<previously logged>
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
+WARNING:  AUDIT: SESSION,4,1,READ,SELECT,,,SELECT 1,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 DO $$ BEGIN PERFORM test2_change(91); END $$;
 WARNING:  AUDIT: SESSION,5,1,READ,SELECT,,,SELECT test2_change(91),<not logged>
 WARNING:  AUDIT: SESSION,5,2,WRITE,UPDATE,,,"UPDATE test2
@@ -254,52 +254,49 @@ WARNING:  AUDIT: OBJECT,5,2,WRITE,UPDATE,TABLE,public.test2,<previously logged>,
 -- Object logged because of:
 -- insert on test3
 -- update on test2
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
-WARNING:  AUDIT: SESSION,6,1,WRITE,INSERT,,,"WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte",<not logged>
-WARNING:  AUDIT: OBJECT,6,1,WRITE,INSERT,TABLE,public.test3,<previously logged>,<previously logged>
-WARNING:  AUDIT: OBJECT,6,1,WRITE,UPDATE,TABLE,public.test2,<previously logged>,<previously logged>
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+SELECT 1;
+WARNING:  AUDIT: SESSION,6,1,READ,SELECT,,,SELECT 1,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 --
 -- Object logged because of:
 -- insert on test2
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
-WARNING:  AUDIT: SESSION,7,1,WRITE,UPDATE,,,"WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id",<not logged>
-WARNING:  AUDIT: OBJECT,7,1,WRITE,INSERT,TABLE,public.test2,<previously logged>,<previously logged>
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
+WARNING:  AUDIT: SESSION,7,1,READ,SELECT,,,SELECT 1,<not logged>
+ ?column? 
+----------
+        1
+(1 row)
+
 --
 -- Be sure that test has correct contents
+-- WHPG: test2 is empty, the writable CTEs above do not run in WarehousePG.
 SELECT *
   FROM test2
  ORDER BY ID;
@@ -307,11 +304,9 @@ WARNING:  AUDIT: SESSION,8,1,READ,SELECT,,,"SELECT *
   FROM test2
  ORDER BY ID",<not logged>
 WARNING:  AUDIT: OBJECT,8,1,READ,SELECT,TABLE,public.test2,<previously logged>,<previously logged>
- id  
------
-  45
- 127
-(2 rows)
+ id 
+----
+(0 rows)
 
 --
 -- Change permissions of user 2 so that only object logging will be done
@@ -922,8 +917,11 @@ NOTICE:  AUDIT: SESSION,23,1,DDL,CREATE INDEX,INDEX,public.test_pkey,"CREATE TAB
 )",<none>
 --
 -- Check that analyze is logged
+-- WHPG: the coordinator samples the segments with gp_acquire_sample_rows(),
+-- which is logged.
 ANALYZE test;
-NOTICE:  AUDIT: SESSION,24,1,MISC,ANALYZE,,,ANALYZE test,<none>
+NOTICE:  AUDIT: SESSION,24,1,READ,SELECT,,,"select pg_catalog.gp_acquire_sample_rows(21766, 10000, 'f')",<none>
+NOTICE:  AUDIT: SESSION,24,2,MISC,ANALYZE,,,ANALYZE test,<none>
 --
 -- Grants to public should not cause object logging (session logging will
 -- still happen)
@@ -1006,6 +1004,7 @@ INSERT INTO TEST (id)
 		  VALUES (3);
 NOTICE:  AUDIT: SESSION,33,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
 		  VALUES (3)",<none>
+-- WHPG: ORDER BY in the loop query, rows of a distributed table come in any order.
 DO $$
 DECLARE
 	result RECORD;
@@ -1013,6 +1012,7 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
@@ -1025,13 +1025,15 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
 	END LOOP;
 END $$",<none>
 NOTICE:  AUDIT: SESSION,34,2,READ,SELECT,TABLE,public.test,"SELECT id
-		  FROM test",<none>
+		  FROM test
+		 ORDER BY id",<none>
 NOTICE:  AUDIT: SESSION,34,3,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
 			 VALUES (result.id + 100)",",,1"
 NOTICE:  AUDIT: SESSION,34,4,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
@@ -1324,10 +1326,11 @@ GRANT UPDATE
 INSERT INTO aaa VALUES (generate_series(1,100));
 NOTICE:  AUDIT: SESSION,66,1,WRITE,INSERT,TABLE,public.aaa,"INSERT INTO aaa VALUES (generate_series(1,100))",<none>
 SET pgaudit.log_parameter TO OFF;
+-- WHPG: the trigger on bbb runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the insert fails.
 INSERT INTO bbb VALUES (1);
 NOTICE:  AUDIT: SESSION,67,1,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1),<not logged>
-NOTICE:  AUDIT: OBJECT,67,2,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,<not logged>
-NOTICE:  AUDIT: SESSION,67,2,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,<not logged>
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 SET pgaudit.log_parameter TO ON;
 DROP TABLE bbb;
 DROP TABLE aaa;
@@ -1414,17 +1417,19 @@ NOTICE:  AUDIT: SESSION,93,1,READ,SELECT,TABLE,public.h_0,SELECT * FROM h_0,<non
 
 COPY h FROM stdin;
 NOTICE:  AUDIT: SESSION,94,1,WRITE,COPY,TABLE,public.h,COPY h FROM stdin,<none>
+-- WHPG: the rows come back segment by segment, not in insert order.
 COPY h TO stdout;
 NOTICE:  AUDIT: SESSION,95,1,READ,COPY,TABLE,public.h,COPY h TO stdout,<none>
+2	2
+1	1
+3	3
+-- WHPG: ORDER BY, rows of a distributed table come in any order.
+COPY (SELECT * FROM h ORDER BY x) TO stdout;
+NOTICE:  AUDIT: SESSION,96,1,READ,SELECT,TABLE,public.h,COPY (SELECT * FROM h ORDER BY x) TO stdout,<none>
 1	1
 2	2
 3	3
-COPY (SELECT * FROM h) TO stdout;
-NOTICE:  AUDIT: SESSION,96,1,READ,SELECT,TABLE,public.h,COPY (SELECT * FROM h) TO stdout,<none>
-1	1
-2	2
-3	3
-NOTICE:  AUDIT: SESSION,96,2,READ,COPY,,,COPY (SELECT * FROM h) TO stdout,<none>
+NOTICE:  AUDIT: SESSION,96,2,READ,COPY,,,COPY (SELECT * FROM h ORDER BY x) TO stdout,<none>
 CREATE INDEX h_idx ON h (x);
 NOTICE:  AUDIT: SESSION,97,1,DDL,CREATE INDEX,,,CREATE INDEX h_idx ON h (x),<none>
 DROP INDEX h_idx;
@@ -1445,16 +1450,14 @@ CREATE TABLE fk_fk (id int);
 NOTICE:  AUDIT: SESSION,102,1,DDL,CREATE TABLE,,,CREATE TABLE fk_fk (id int),<none>
 INSERT INTO fk_fk VALUES (1);
 NOTICE:  AUDIT: SESSION,103,1,WRITE,INSERT,TABLE,public.fk_fk,INSERT INTO fk_fk VALUES (1),<none>
+-- WHPG: WarehousePG does not enforce foreign keys, so no validation query is
+-- run or logged.
 ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey FOREIGN KEY (id) REFERENCES fk_pk(id);
-NOTICE:  AUDIT: SESSION,104,1,READ,SELECT,TABLE,public.fk_fk,"SELECT fk.""id"" FROM ONLY ""public"".""fk_fk"" fk LEFT OUTER JOIN ONLY ""public"".""fk_pk"" pk ON ( pk.""id"" OPERATOR(pg_catalog.=) fk.""id"") WHERE pk.""id"" IS NULL AND (fk.""id"" IS NOT NULL)",<none>
-NOTICE:  AUDIT: SESSION,104,1,READ,SELECT,TABLE,public.fk_pk,"SELECT fk.""id"" FROM ONLY ""public"".""fk_fk"" fk LEFT OUTER JOIN ONLY ""public"".""fk_pk"" pk ON ( pk.""id"" OPERATOR(pg_catalog.=) fk.""id"") WHERE pk.""id"" IS NULL AND (fk.""id"" IS NOT NULL)",<none>
-NOTICE:  AUDIT: SESSION,104,2,DDL,ALTER TABLE,,,ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey FOREIGN KEY (id) REFERENCES fk_pk(id),<none>
+NOTICE:  AUDIT: SESSION,104,1,DDL,ALTER TABLE,,,ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey FOREIGN KEY (id) REFERENCES fk_pk(id),<none>
 ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey_nv FOREIGN KEY (id) REFERENCES fk_pk(id) NOT VALID;
 NOTICE:  AUDIT: SESSION,105,1,DDL,ALTER TABLE,,,ALTER TABLE fk_fk ADD CONSTRAINT fk_fk_id_fkey_nv FOREIGN KEY (id) REFERENCES fk_pk(id) NOT VALID,<none>
 ALTER TABLE fk_fk VALIDATE CONSTRAINT fk_fk_id_fkey_nv;
-NOTICE:  AUDIT: SESSION,106,1,READ,SELECT,TABLE,public.fk_fk,"SELECT fk.""id"" FROM ONLY ""public"".""fk_fk"" fk LEFT OUTER JOIN ONLY ""public"".""fk_pk"" pk ON ( pk.""id"" OPERATOR(pg_catalog.=) fk.""id"") WHERE pk.""id"" IS NULL AND (fk.""id"" IS NOT NULL)",<none>
-NOTICE:  AUDIT: SESSION,106,1,READ,SELECT,TABLE,public.fk_pk,"SELECT fk.""id"" FROM ONLY ""public"".""fk_fk"" fk LEFT OUTER JOIN ONLY ""public"".""fk_pk"" pk ON ( pk.""id"" OPERATOR(pg_catalog.=) fk.""id"") WHERE pk.""id"" IS NULL AND (fk.""id"" IS NOT NULL)",<none>
-NOTICE:  AUDIT: SESSION,106,2,DDL,ALTER TABLE,,,ALTER TABLE fk_fk VALIDATE CONSTRAINT fk_fk_id_fkey_nv,<none>
+NOTICE:  AUDIT: SESSION,106,1,DDL,ALTER TABLE,,,ALTER TABLE fk_fk VALIDATE CONSTRAINT fk_fk_id_fkey_nv,<none>
 DROP TABLE fk_fk;
 NOTICE:  AUDIT: SESSION,107,1,DDL,DROP TABLE,,,DROP TABLE fk_fk,<none>
 DROP TABLE fk_pk;
@@ -1465,6 +1468,8 @@ NOTICE:  AUDIT: SESSION,108,1,DDL,DROP TABLE,,,DROP TABLE fk_pk,<none>
 -- trigger, which runs after the statement's own check or, when the constraint
 -- is deferred, at COMMIT.  A top-level COMMIT runs with the stack empty, while
 -- one made by a procedure or DO block runs with the CALL or DO on top.
+-- WHPG: WarehousePG creates foreign key triggers disabled, so no FK check runs
+-- and this block does not reach the RI fast path.
 CREATE TABLE ri_pk (id int PRIMARY KEY);
 NOTICE:  AUDIT: SESSION,109,1,DDL,CREATE TABLE,,,CREATE TABLE ri_pk (id int PRIMARY KEY),<none>
 CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE);
@@ -1596,100 +1601,69 @@ SELECT *
   FROM test3",<none>,0
 --
 -- Test DML
+-- WHPG: the trigger on test2 runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the inserts into test2 fail and test2 stays empty.
 INSERT INTO test2 (id, name)
 		  VALUES (1, 'a');
-NOTICE:  AUDIT: SESSION,13,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-	   SET id = id + 90
-	 WHERE id = new.id",",,,,,,,,,,,,,1",1
-NOTICE:  AUDIT: SESSION,13,2,WRITE,INSERT,TABLE,public.test2,"INSERT INTO test2 (id, name)
-		  VALUES (1, 'a')",<none>,1
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 INSERT INTO test2 (id, name)
 		  VALUES (2, 'b');
-NOTICE:  AUDIT: SESSION,14,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-	   SET id = id + 90
-	 WHERE id = new.id",",,,,,,,,,,,,,2",1
-NOTICE:  AUDIT: SESSION,14,2,WRITE,INSERT,TABLE,public.test2,"INSERT INTO test2 (id, name)
-		  VALUES (2, 'b')",<none>,1
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 INSERT INTO test2 (id, name)
 		  VALUES (3, 'c');
-NOTICE:  AUDIT: SESSION,15,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-	   SET id = id + 90
-	 WHERE id = new.id",",,,,,,,,,,,,,3",1
-NOTICE:  AUDIT: SESSION,15,2,WRITE,INSERT,TABLE,public.test2,"INSERT INTO test2 (id, name)
-		  VALUES (3, 'c')",<none>,1
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 INSERT INTO test3 (id, name)
 		  VALUES (1, 'a');
-NOTICE:  AUDIT: SESSION,16,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
+NOTICE:  AUDIT: SESSION,13,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
 		  VALUES (1, 'a')",<none>,1
 INSERT INTO test3 (id, name)
 		  VALUES (2, 'b');
-NOTICE:  AUDIT: SESSION,17,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
+NOTICE:  AUDIT: SESSION,14,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
 		  VALUES (2, 'b')",<none>,1
 INSERT INTO test3 (id, name)
 		  VALUES (3, 'c');
-NOTICE:  AUDIT: SESSION,18,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
+NOTICE:  AUDIT: SESSION,15,1,WRITE,INSERT,TABLE,public.test3,"INSERT INTO test3 (id, name)
 		  VALUES (3, 'c')",<none>,1
 SELECT *
   FROM test3, test2;
-NOTICE:  AUDIT: SESSION,19,1,READ,SELECT,TABLE,public.test3,"SELECT *
-  FROM test3, test2",<none>,9
-NOTICE:  AUDIT: SESSION,19,1,READ,SELECT,TABLE,public.test2,"SELECT *
-  FROM test3, test2",<none>,9
+NOTICE:  AUDIT: SESSION,16,1,READ,SELECT,TABLE,public.test3,"SELECT *
+  FROM test3, test2",<none>,0
+NOTICE:  AUDIT: SESSION,16,1,READ,SELECT,TABLE,public.test2,"SELECT *
+  FROM test3, test2",<none>,0
  id | name | id | name 
 ----+------+----+------
-  1 | a    | 91 | a
-  1 | a    | 92 | b
-  1 | a    | 93 | c
-  2 | b    | 91 | a
-  2 | b    | 92 | b
-  2 | b    | 93 | c
-  3 | c    | 91 | a
-  3 | c    | 92 | b
-  3 | c    | 93 | c
-(9 rows)
+(0 rows)
 
 SELECT *
   FROM vw_test3, test2;
-NOTICE:  AUDIT: SESSION,20,1,READ,SELECT,VIEW,public.vw_test3,"SELECT *
-  FROM vw_test3, test2",<none>,9
-NOTICE:  AUDIT: SESSION,20,1,READ,SELECT,TABLE,public.test2,"SELECT *
-  FROM vw_test3, test2",<none>,9
-NOTICE:  AUDIT: SESSION,20,1,READ,SELECT,TABLE,public.test3,"SELECT *
-  FROM vw_test3, test2",<none>,9
+NOTICE:  AUDIT: SESSION,17,1,READ,SELECT,VIEW,public.vw_test3,"SELECT *
+  FROM vw_test3, test2",<none>,0
+NOTICE:  AUDIT: SESSION,17,1,READ,SELECT,TABLE,public.test2,"SELECT *
+  FROM vw_test3, test2",<none>,0
+NOTICE:  AUDIT: SESSION,17,1,READ,SELECT,TABLE,public.test3,"SELECT *
+  FROM vw_test3, test2",<none>,0
  id | name | id | name 
 ----+------+----+------
-  1 | a    | 91 | a
-  1 | a    | 92 | b
-  1 | a    | 93 | c
-  2 | b    | 91 | a
-  2 | b    | 92 | b
-  2 | b    | 93 | c
-  3 | c    | 91 | a
-  3 | c    | 92 | b
-  3 | c    | 93 | c
-(9 rows)
+(0 rows)
 
 SELECT *
   FROM test2
  ORDER BY ID;
-NOTICE:  AUDIT: SESSION,21,1,READ,SELECT,TABLE,public.test2,"SELECT *
+NOTICE:  AUDIT: SESSION,18,1,READ,SELECT,TABLE,public.test2,"SELECT *
   FROM test2
- ORDER BY ID",<none>,3
+ ORDER BY ID",<none>,0
  id | name 
 ----+------
- 91 | a
- 92 | b
- 93 | c
-(3 rows)
+(0 rows)
 
 UPDATE test2
    SET name = 'd';
-NOTICE:  AUDIT: SESSION,22,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-   SET name = 'd'",<none>,3
+NOTICE:  AUDIT: SESSION,19,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
+   SET name = 'd'",<none>,0
 UPDATE test3
    SET name = 'd'
  WHERE id > 0;
-NOTICE:  AUDIT: SESSION,23,1,WRITE,UPDATE,TABLE,public.test3,"UPDATE test3
+NOTICE:  AUDIT: SESSION,20,1,WRITE,UPDATE,TABLE,public.test3,"UPDATE test3
    SET name = 'd'
  WHERE id > 0",<none>,3
 SELECT 1
@@ -1699,7 +1673,7 @@ SELECT 1
 	  FROM pg_class
 	  LIMIT 3
 ) SUBQUERY;
-NOTICE:  AUDIT: SESSION,24,1,READ,SELECT,TABLE,pg_catalog.pg_class,"SELECT 1
+NOTICE:  AUDIT: SESSION,21,1,READ,SELECT,TABLE,pg_catalog.pg_class,"SELECT 1
   FROM
 (
 	SELECT relname
@@ -1713,146 +1687,94 @@ NOTICE:  AUDIT: SESSION,24,1,READ,SELECT,TABLE,pg_catalog.pg_class,"SELECT 1
         1
 (3 rows)
 
-WITH CTE AS
-(
-	SELECT id
-	  FROM test2
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
-NOTICE:  AUDIT: SESSION,25,1,WRITE,INSERT,TABLE,public.test3,"WITH CTE AS
-(
-	SELECT id
-	  FROM test2
-)
-INSERT INTO test3
-SELECT id
-  FROM cte",<none>,3
-NOTICE:  AUDIT: SESSION,25,1,READ,SELECT,TABLE,public.test2,"WITH CTE AS
-(
-	SELECT id
-	  FROM test2
-)
-INSERT INTO test3
-SELECT id
-  FROM cte",<none>,3
-WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte;
-NOTICE:  AUDIT: SESSION,26,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-	   SET id = id + 90
-	 WHERE id = new.id",",,,,,,,,,,,,,1",1
-NOTICE:  AUDIT: SESSION,26,2,WRITE,INSERT,TABLE,public.test2,"WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte",<none>,1
-NOTICE:  AUDIT: SESSION,26,2,WRITE,INSERT,TABLE,public.test3,"WITH CTE AS
-(
-	INSERT INTO test3 VALUES (1)
-				   RETURNING id
-)
-INSERT INTO test2
-SELECT id
-  FROM cte",<none>,1
+-- WHPG: on one line, so that each audit entry is one line and the two entries
+-- compare in any order. GPORCA logs the table of the CTE first.
+WITH CTE AS (SELECT id FROM test2) INSERT INTO test3 SELECT id FROM cte;
+NOTICE:  AUDIT: SESSION,22,1,WRITE,INSERT,TABLE,public.test3,WITH CTE AS (SELECT id FROM test2) INSERT INTO test3 SELECT id FROM cte,<none>,0
+NOTICE:  AUDIT: SESSION,22,1,READ,SELECT,TABLE,public.test2,WITH CTE AS (SELECT id FROM test2) INSERT INTO test3 SELECT id FROM cte,<none>,0
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test3 VALUES (1)
+-- 				   RETURNING id
+-- )
+-- INSERT INTO test2
+-- SELECT id
+--   FROM cte;
+SELECT 1;
+NOTICE:  AUDIT: SESSION,23,1,READ,SELECT,,,SELECT 1,<none>,1
+ ?column? 
+----------
+        1
+(1 row)
+
 DO $$ BEGIN PERFORM test2_change(91); END $$;
-NOTICE:  AUDIT: SESSION,27,1,FUNCTION,DO,,,DO $$ BEGIN PERFORM test2_change(91); END $$,<none>,0
-NOTICE:  AUDIT: SESSION,27,2,FUNCTION,EXECUTE,FUNCTION,public.test2_change,SELECT test2_change(91),<none>,0
-NOTICE:  AUDIT: SESSION,27,3,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
+NOTICE:  AUDIT: SESSION,24,1,FUNCTION,DO,,,DO $$ BEGIN PERFORM test2_change(91); END $$,<none>,0
+NOTICE:  AUDIT: SESSION,24,2,FUNCTION,EXECUTE,FUNCTION,public.test2_change,SELECT test2_change(91),<none>,0
+NOTICE:  AUDIT: SESSION,24,3,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
 	   SET id = id + 1
-	 WHERE id = change_id","91,",2
-NOTICE:  AUDIT: SESSION,27,4,READ,SELECT,,,SELECT test2_change(91),<none>,1
-WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte;
-NOTICE:  AUDIT: SESSION,28,1,WRITE,INSERT,TABLE,public.test3,"WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte",<none>,3
-NOTICE:  AUDIT: SESSION,28,1,WRITE,UPDATE,TABLE,public.test2,"WITH CTE AS
-(
-	UPDATE test2
-	   SET id = 45
-	 WHERE id = 92
-	RETURNING id
-)
-INSERT INTO test3
-SELECT id
-  FROM cte",<none>,3
-WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id;
-NOTICE:  AUDIT: SESSION,29,1,WRITE,UPDATE,TABLE,public.test2,"UPDATE test2
-	   SET id = id + 90
-	 WHERE id = new.id",",,,,,,,,,,,,,37",1
-NOTICE:  AUDIT: SESSION,29,2,WRITE,UPDATE,TABLE,public.test3,"WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id",<none>,10
-NOTICE:  AUDIT: SESSION,29,2,WRITE,INSERT,TABLE,public.test2,"WITH CTE AS
-(
-	INSERT INTO test2 VALUES (37)
-				   RETURNING id
-)
-UPDATE test3
-   SET id = cte.id
-  FROM cte
- WHERE test3.id <> cte.id",<none>,10
+	 WHERE id = change_id","91,",0
+NOTICE:  AUDIT: SESSION,24,4,READ,SELECT,,,SELECT test2_change(91),<none>,1
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	UPDATE test2
+-- 	   SET id = 45
+-- 	 WHERE id = 92
+-- 	RETURNING id
+-- )
+-- INSERT INTO test3
+-- SELECT id
+--   FROM cte;
+SELECT 1;
+NOTICE:  AUDIT: SESSION,25,1,READ,SELECT,,,SELECT 1,<none>,1
+ ?column? 
+----------
+        1
+(1 row)
+
+-- WHPG: a writable CTE cannot feed a writable statement in WarehousePG.
+-- SELECT 1 keeps the statement ids the same.
+-- WITH CTE AS
+-- (
+-- 	INSERT INTO test2 VALUES (37)
+-- 				   RETURNING id
+-- )
+-- UPDATE test3
+--    SET id = cte.id
+--   FROM cte
+--  WHERE test3.id <> cte.id;
+SELECT 1;
+NOTICE:  AUDIT: SESSION,26,1,READ,SELECT,,,SELECT 1,<none>,1
+ ?column? 
+----------
+        1
+(1 row)
+
 DELETE
   FROM test2;
-NOTICE:  AUDIT: SESSION,30,1,WRITE,DELETE,TABLE,public.test2,"DELETE
-  FROM test2",<none>,5
+NOTICE:  AUDIT: SESSION,27,1,WRITE,DELETE,TABLE,public.test2,"DELETE
+  FROM test2",<none>,0
 DELETE
   FROM test3
  WHERE id > 0;
-NOTICE:  AUDIT: SESSION,31,1,WRITE,DELETE,TABLE,public.test3,"DELETE
+NOTICE:  AUDIT: SESSION,28,1,WRITE,DELETE,TABLE,public.test3,"DELETE
   FROM test3
- WHERE id > 0",<none>,10
+ WHERE id > 0",<none>,3
 --
 -- Drop test tables
 DROP TABLE test2;
-NOTICE:  AUDIT: SESSION,32,1,DDL,DROP TABLE,,,DROP TABLE test2,<none>,0
+NOTICE:  AUDIT: SESSION,29,1,DDL,DROP TABLE,,,DROP TABLE test2,<none>,0
 DROP VIEW vw_test3;
-NOTICE:  AUDIT: SESSION,33,1,DDL,DROP VIEW,,,DROP VIEW vw_test3,<none>,0
+NOTICE:  AUDIT: SESSION,30,1,DDL,DROP VIEW,,,DROP VIEW vw_test3,<none>,0
 DROP TABLE test3;
-NOTICE:  AUDIT: SESSION,34,1,DDL,DROP TABLE,,,DROP TABLE test3,<none>,0
+NOTICE:  AUDIT: SESSION,31,1,DDL,DROP TABLE,,,DROP TABLE test3,<none>,0
 DROP FUNCTION test2_insert();
-NOTICE:  AUDIT: SESSION,35,1,DDL,DROP FUNCTION,,,DROP FUNCTION test2_insert(),<none>,0
+NOTICE:  AUDIT: SESSION,32,1,DDL,DROP FUNCTION,,,DROP FUNCTION test2_insert(),<none>,0
 DROP FUNCTION test2_change(int);
-NOTICE:  AUDIT: SESSION,36,1,DDL,DROP FUNCTION,,,DROP FUNCTION test2_change(int),<none>,0
+NOTICE:  AUDIT: SESSION,33,1,DDL,DROP FUNCTION,,,DROP FUNCTION test2_change(int),<none>,0
 --
 -- Only object logging will be done
 SET pgaudit.log = 'none';
@@ -1861,7 +1783,7 @@ SET pgaudit.role = 'regress_auditor';
 -- Select is session logged
 SELECT *
   FROM account;
-NOTICE:  AUDIT: OBJECT,37,1,READ,SELECT,TABLE,public.account,"SELECT *
+NOTICE:  AUDIT: OBJECT,34,1,READ,SELECT,TABLE,public.account,"SELECT *
   FROM account",<none>,1
  id |     name      | password | description 
 ----+---------------+----------+-------------
@@ -1891,7 +1813,7 @@ SELECT id,
 -- select (password) on account
 SELECT password
   FROM account;
-NOTICE:  AUDIT: OBJECT,38,1,READ,SELECT,TABLE,public.account,"SELECT password
+NOTICE:  AUDIT: OBJECT,35,1,READ,SELECT,TABLE,public.account,"SELECT password
   FROM account",<none>,3
  password 
 ----------
@@ -1909,7 +1831,7 @@ UPDATE account
 -- update (password) on account
 UPDATE account
    SET password = 'HASH4';
-NOTICE:  AUDIT: OBJECT,39,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: OBJECT,36,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET password = 'HASH4'",<none>,3
 --
 -- Session relation logging will be done
@@ -1925,22 +1847,22 @@ SELECT account.password,
   FROM account
 	   INNER JOIN account_role_map
 			on account.id = account_role_map.account_id;
-NOTICE:  AUDIT: OBJECT,40,1,READ,SELECT,TABLE,public.account,"SELECT account.password,
+NOTICE:  AUDIT: OBJECT,37,1,READ,SELECT,TABLE,public.account,"SELECT account.password,
 	   account_role_map.role_id
   FROM account
 	   INNER JOIN account_role_map
 			on account.id = account_role_map.account_id",<none>,0
-NOTICE:  AUDIT: SESSION,40,1,READ,SELECT,TABLE,public.account,"SELECT account.password,
+NOTICE:  AUDIT: SESSION,37,1,READ,SELECT,TABLE,public.account,"SELECT account.password,
 	   account_role_map.role_id
   FROM account
 	   INNER JOIN account_role_map
 			on account.id = account_role_map.account_id",<none>,0
-NOTICE:  AUDIT: OBJECT,40,1,READ,SELECT,TABLE,public.account_role_map,"SELECT account.password,
+NOTICE:  AUDIT: OBJECT,37,1,READ,SELECT,TABLE,public.account_role_map,"SELECT account.password,
 	   account_role_map.role_id
   FROM account
 	   INNER JOIN account_role_map
 			on account.id = account_role_map.account_id",<none>,0
-NOTICE:  AUDIT: SESSION,40,1,READ,SELECT,TABLE,public.account_role_map,"SELECT account.password,
+NOTICE:  AUDIT: SESSION,37,1,READ,SELECT,TABLE,public.account_role_map,"SELECT account.password,
 	   account_role_map.role_id
   FROM account
 	   INNER JOIN account_role_map
@@ -1955,9 +1877,9 @@ NOTICE:  AUDIT: SESSION,40,1,READ,SELECT,TABLE,public.account_role_map,"SELECT a
 -- Session logged on all tables because log = read and log_relation = on
 SELECT password
   FROM account;
-NOTICE:  AUDIT: OBJECT,41,1,READ,SELECT,TABLE,public.account,"SELECT password
+NOTICE:  AUDIT: OBJECT,38,1,READ,SELECT,TABLE,public.account,"SELECT password
   FROM account",<none>,3
-NOTICE:  AUDIT: SESSION,41,1,READ,SELECT,TABLE,public.account,"SELECT password
+NOTICE:  AUDIT: SESSION,38,1,READ,SELECT,TABLE,public.account,"SELECT password
   FROM account",<none>,3
  password 
 ----------
@@ -1971,7 +1893,7 @@ NOTICE:  AUDIT: SESSION,41,1,READ,SELECT,TABLE,public.account,"SELECT password
 -- Session logged on all tables because log = read and log_relation = on
 UPDATE account
    SET description = 'yada, yada2';
-NOTICE:  AUDIT: SESSION,42,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: SESSION,39,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET description = 'yada, yada2'",<none>,3
 --
 -- Object logged because of:
@@ -1980,10 +1902,10 @@ NOTICE:  AUDIT: SESSION,42,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
 UPDATE account
    SET description = 'yada, yada3'
  where password = 'HASH4';
-NOTICE:  AUDIT: OBJECT,43,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: OBJECT,40,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET description = 'yada, yada3'
  where password = 'HASH4'",<none>,3
-NOTICE:  AUDIT: SESSION,43,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: SESSION,40,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET description = 'yada, yada3'
  where password = 'HASH4'",<none>,3
 --
@@ -1992,29 +1914,29 @@ NOTICE:  AUDIT: SESSION,43,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
 -- Session logged on all tables because log = read and log_relation = on
 UPDATE account
    SET password = 'HASH4';
-NOTICE:  AUDIT: OBJECT,44,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: OBJECT,41,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET password = 'HASH4'",<none>,3
-NOTICE:  AUDIT: SESSION,44,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
+NOTICE:  AUDIT: SESSION,41,1,WRITE,UPDATE,TABLE,public.account,"UPDATE account
    SET password = 'HASH4'",<none>,3
 --
 -- Exhaustive tests
 SET pgaudit.log = 'all';
-NOTICE:  AUDIT: SESSION,45,1,MISC,SET,,,SET pgaudit.log = 'all',<none>,0
+NOTICE:  AUDIT: SESSION,42,1,MISC,SET,,,SET pgaudit.log = 'all',<none>,0
 SET pgaudit.log_client = on;
-NOTICE:  AUDIT: SESSION,46,1,MISC,SET,,,SET pgaudit.log_client = on,<none>,0
+NOTICE:  AUDIT: SESSION,43,1,MISC,SET,,,SET pgaudit.log_client = on,<none>,0
 SET pgaudit.log_relation = on;
-NOTICE:  AUDIT: SESSION,47,1,MISC,SET,,,SET pgaudit.log_relation = on,<none>,0
+NOTICE:  AUDIT: SESSION,44,1,MISC,SET,,,SET pgaudit.log_relation = on,<none>,0
 SET pgaudit.log_parameter = on;
-NOTICE:  AUDIT: SESSION,48,1,MISC,SET,,,SET pgaudit.log_parameter = on,<none>,0
+NOTICE:  AUDIT: SESSION,45,1,MISC,SET,,,SET pgaudit.log_parameter = on,<none>,0
 SET pgaudit.log_rows = on;
-NOTICE:  AUDIT: SESSION,49,1,MISC,SET,,,SET pgaudit.log_rows = on,<none>,0
+NOTICE:  AUDIT: SESSION,46,1,MISC,SET,,,SET pgaudit.log_rows = on,<none>,0
 --
 -- Simple DO block
 DO $$
 BEGIN
 	raise notice 'test';
 END $$;
-NOTICE:  AUDIT: SESSION,50,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,47,1,FUNCTION,DO,,,"DO $$
 BEGIN
 	raise notice 'test';
 END $$",<none>,0
@@ -2025,37 +1947,40 @@ COPY account TO stdout;
 1	regress_user1	HASH4	yada, yada3
 1	regress_user2	HASH4	yada, yada3
 1	user3	HASH4	yada, yada3
-NOTICE:  AUDIT: OBJECT,51,1,READ,COPY,TABLE,public.account,COPY account TO stdout,<none>,3
-NOTICE:  AUDIT: SESSION,51,1,READ,COPY,TABLE,public.account,COPY account TO stdout,<none>,3
+NOTICE:  AUDIT: OBJECT,48,1,READ,COPY,TABLE,public.account,COPY account TO stdout,<none>,3
+NOTICE:  AUDIT: SESSION,48,1,READ,COPY,TABLE,public.account,COPY account TO stdout,<none>,3
 --
 -- Drop a table from a query
 DROP TABLE test.account_copy;
-NOTICE:  AUDIT: SESSION,52,1,DDL,DROP TABLE,,,DROP TABLE test.account_copy,<none>,0
+NOTICE:  AUDIT: SESSION,49,1,DDL,DROP TABLE,,,DROP TABLE test.account_copy,<none>,0
 --
 -- Create a table from a query
+-- WHPG: the SELECT entries report 0 rows, the coordinator gets the
+-- row count of CREATE TABLE AS only in ExecutorEnd. Accepted output until
+-- the server provides it earlier.
 CREATE TABLE test.account_copy AS
 SELECT *
   FROM account;
-NOTICE:  AUDIT: OBJECT,53,1,READ,SELECT,TABLE,public.account,"CREATE TABLE test.account_copy AS
+NOTICE:  AUDIT: OBJECT,50,1,READ,SELECT,TABLE,public.account,"CREATE TABLE test.account_copy AS
 SELECT *
-  FROM account",<none>,3
-NOTICE:  AUDIT: SESSION,53,1,READ,SELECT,TABLE,public.account,"CREATE TABLE test.account_copy AS
+  FROM account",<none>,0
+NOTICE:  AUDIT: SESSION,50,1,READ,SELECT,TABLE,public.account,"CREATE TABLE test.account_copy AS
 SELECT *
-  FROM account",<none>,3
-NOTICE:  AUDIT: SESSION,53,2,DDL,CREATE TABLE AS,,,"CREATE TABLE test.account_copy AS
+  FROM account",<none>,0
+NOTICE:  AUDIT: SESSION,50,2,DDL,CREATE TABLE AS,,,"CREATE TABLE test.account_copy AS
 SELECT *
   FROM account",<none>,0
 --
 -- Copy from stdin to account copy
 COPY test.account_copy from stdin;
-NOTICE:  AUDIT: SESSION,54,1,WRITE,COPY,TABLE,test.account_copy,COPY test.account_copy from stdin,<none>,1
+NOTICE:  AUDIT: SESSION,51,1,WRITE,COPY,TABLE,test.account_copy,COPY test.account_copy from stdin,<none>,1
 --
 -- Test prepared statement
 PREPARE pgclassstmt1 (oid) AS
 SELECT 1
   FROM account
  WHERE id = $1;
-NOTICE:  AUDIT: SESSION,55,1,READ,PREPARE,,,"PREPARE pgclassstmt1 (oid) AS
+NOTICE:  AUDIT: SESSION,52,1,READ,PREPARE,,,"PREPARE pgclassstmt1 (oid) AS
 SELECT 1
   FROM account
  WHERE id = $1",<none>,0
@@ -2063,16 +1988,16 @@ PREPARE pgclassstmt2 (oid) AS
 SELECT 2
   FROM account
  WHERE id = $1;
-NOTICE:  AUDIT: SESSION,56,1,READ,PREPARE,,,"PREPARE pgclassstmt2 (oid) AS
+NOTICE:  AUDIT: SESSION,53,1,READ,PREPARE,,,"PREPARE pgclassstmt2 (oid) AS
 SELECT 2
   FROM account
  WHERE id = $1",<none>,0
 EXECUTE pgclassstmt2 (1);
-NOTICE:  AUDIT: SESSION,57,1,READ,SELECT,TABLE,public.account,"PREPARE pgclassstmt2 (oid) AS
+NOTICE:  AUDIT: SESSION,54,1,READ,SELECT,TABLE,public.account,"PREPARE pgclassstmt2 (oid) AS
 SELECT 2
   FROM account
  WHERE id = $1",1,3
-NOTICE:  AUDIT: SESSION,57,2,MISC,EXECUTE,,,EXECUTE pgclassstmt2 (1),<none>,0
+NOTICE:  AUDIT: SESSION,54,2,MISC,EXECUTE,,,EXECUTE pgclassstmt2 (1),<none>,0
  ?column? 
 ----------
         2
@@ -2081,11 +2006,11 @@ NOTICE:  AUDIT: SESSION,57,2,MISC,EXECUTE,,,EXECUTE pgclassstmt2 (1),<none>,0
 (3 rows)
 
 EXECUTE pgclassstmt1 (1);
-NOTICE:  AUDIT: SESSION,58,1,READ,SELECT,TABLE,public.account,"PREPARE pgclassstmt1 (oid) AS
+NOTICE:  AUDIT: SESSION,55,1,READ,SELECT,TABLE,public.account,"PREPARE pgclassstmt1 (oid) AS
 SELECT 1
   FROM account
  WHERE id = $1",1,3
-NOTICE:  AUDIT: SESSION,58,2,MISC,EXECUTE,,,EXECUTE pgclassstmt1 (1),<none>,0
+NOTICE:  AUDIT: SESSION,55,2,MISC,EXECUTE,,,EXECUTE pgclassstmt1 (1),<none>,0
  ?column? 
 ----------
         1
@@ -2094,13 +2019,13 @@ NOTICE:  AUDIT: SESSION,58,2,MISC,EXECUTE,,,EXECUTE pgclassstmt1 (1),<none>,0
 (3 rows)
 
 DEALLOCATE pgclassstmt2;
-NOTICE:  AUDIT: SESSION,59,1,MISC,DEALLOCATE,,,DEALLOCATE pgclassstmt2,<none>,0
+NOTICE:  AUDIT: SESSION,56,1,MISC,DEALLOCATE,,,DEALLOCATE pgclassstmt2,<none>,0
 DEALLOCATE pgclassstmt1;
-NOTICE:  AUDIT: SESSION,60,1,MISC,DEALLOCATE,,,DEALLOCATE pgclassstmt1,<none>,0
+NOTICE:  AUDIT: SESSION,57,1,MISC,DEALLOCATE,,,DEALLOCATE pgclassstmt1,<none>,0
 --
 -- Test cursor
 BEGIN;
-NOTICE:  AUDIT: SESSION,61,1,MISC,BEGIN,,,BEGIN,<none>,0
+NOTICE:  AUDIT: SESSION,58,1,MISC,BEGIN,,,BEGIN,<none>,0
 DECLARE ctest1 SCROLL CURSOR FOR
 SELECT 1
   FROM
@@ -2109,7 +2034,7 @@ SELECT 1
 	  FROM pg_class
 	 LIMIT 3
  ) subquery;
-NOTICE:  AUDIT: SESSION,62,1,READ,DECLARE CURSOR,,,"DECLARE ctest1 SCROLL CURSOR FOR
+NOTICE:  AUDIT: SESSION,59,1,READ,DECLARE CURSOR,,,"DECLARE ctest1 SCROLL CURSOR FOR
 SELECT 1
   FROM
 (
@@ -2125,7 +2050,7 @@ SELECT 2
 	  FROM pg_class
 	 LIMIT 3
  ) subquery;
-NOTICE:  AUDIT: SESSION,63,1,READ,DECLARE CURSOR,,,"DECLARE ctest2 SCROLL CURSOR FOR
+NOTICE:  AUDIT: SESSION,60,1,READ,DECLARE CURSOR,,,"DECLARE ctest2 SCROLL CURSOR FOR
 SELECT 2
   FROM
 (
@@ -2134,57 +2059,57 @@ SELECT 2
 	 LIMIT 3
  ) subquery",<none>,0
 FETCH NEXT FROM ctest1;
-NOTICE:  AUDIT: SESSION,64,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
+NOTICE:  AUDIT: SESSION,61,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
  ?column? 
 ----------
         1
 (1 row)
 
 FETCH NEXT FROM ctest2;
-NOTICE:  AUDIT: SESSION,65,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
+NOTICE:  AUDIT: SESSION,62,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
  ?column? 
 ----------
         2
 (1 row)
 
 FETCH NEXT FROM ctest1;
-NOTICE:  AUDIT: SESSION,66,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
+NOTICE:  AUDIT: SESSION,63,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
  ?column? 
 ----------
         1
 (1 row)
 
 FETCH NEXT FROM ctest2;
-NOTICE:  AUDIT: SESSION,67,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
+NOTICE:  AUDIT: SESSION,64,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
  ?column? 
 ----------
         2
 (1 row)
 
 FETCH NEXT FROM ctest1;
-NOTICE:  AUDIT: SESSION,68,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
+NOTICE:  AUDIT: SESSION,65,1,MISC,FETCH,,,FETCH NEXT FROM ctest1,<none>,0
  ?column? 
 ----------
         1
 (1 row)
 
 FETCH NEXT FROM ctest2;
-NOTICE:  AUDIT: SESSION,69,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
+NOTICE:  AUDIT: SESSION,66,1,MISC,FETCH,,,FETCH NEXT FROM ctest2,<none>,0
  ?column? 
 ----------
         2
 (1 row)
 
 CLOSE ctest2;
-NOTICE:  AUDIT: SESSION,70,1,MISC,CLOSE CURSOR,,,CLOSE ctest2,<none>,0
+NOTICE:  AUDIT: SESSION,67,1,MISC,CLOSE CURSOR,,,CLOSE ctest2,<none>,0
 CLOSE ctest1;
-NOTICE:  AUDIT: SESSION,71,1,MISC,CLOSE CURSOR,,,CLOSE ctest1,<none>,0
+NOTICE:  AUDIT: SESSION,68,1,MISC,CLOSE CURSOR,,,CLOSE ctest1,<none>,0
 COMMIT;
-NOTICE:  AUDIT: SESSION,72,1,MISC,COMMIT,,,COMMIT,<none>,0
+NOTICE:  AUDIT: SESSION,69,1,MISC,COMMIT,,,COMMIT,<none>,0
 --
 -- Turn off log_catalog and pg_class will not be logged
 SET pgaudit.log_catalog = off;
-NOTICE:  AUDIT: SESSION,73,1,MISC,SET,,,SET pgaudit.log_catalog = off,<none>,0
+NOTICE:  AUDIT: SESSION,70,1,MISC,SET,,,SET pgaudit.log_catalog = off,<none>,0
 SELECT count(*)
   FROM
 (
@@ -2200,28 +2125,28 @@ SELECT count(*)
 --
 -- Test prepared insert
 DROP TABLE test.test_insert;
-NOTICE:  AUDIT: SESSION,74,1,DDL,DROP TABLE,,,DROP TABLE test.test_insert,<none>,0
+NOTICE:  AUDIT: SESSION,71,1,DDL,DROP TABLE,,,DROP TABLE test.test_insert,<none>,0
 --
 -- Test prepared insert
 CREATE TABLE test.test_insert
 (
 	id INT
 );
-NOTICE:  AUDIT: SESSION,75,1,DDL,CREATE TABLE,,,"CREATE TABLE test.test_insert
+NOTICE:  AUDIT: SESSION,72,1,DDL,CREATE TABLE,,,"CREATE TABLE test.test_insert
 (
 	id INT
 )",<none>,0
 PREPARE pgclassstmt (oid) AS
 INSERT INTO test.test_insert (id)
 					  VALUES ($1);
-NOTICE:  AUDIT: SESSION,76,1,WRITE,PREPARE,,,"PREPARE pgclassstmt (oid) AS
+NOTICE:  AUDIT: SESSION,73,1,WRITE,PREPARE,,,"PREPARE pgclassstmt (oid) AS
 INSERT INTO test.test_insert (id)
 					  VALUES ($1)",<none>,0
 EXECUTE pgclassstmt (1);
-NOTICE:  AUDIT: SESSION,77,1,WRITE,INSERT,TABLE,test.test_insert,"PREPARE pgclassstmt (oid) AS
+NOTICE:  AUDIT: SESSION,74,1,WRITE,INSERT,TABLE,test.test_insert,"PREPARE pgclassstmt (oid) AS
 INSERT INTO test.test_insert (id)
 					  VALUES ($1)",1,1
-NOTICE:  AUDIT: SESSION,77,2,MISC,EXECUTE,,,EXECUTE pgclassstmt (1),<none>,0
+NOTICE:  AUDIT: SESSION,74,2,MISC,EXECUTE,,,EXECUTE pgclassstmt (1),<none>,0
 --
 -- Check that primary key creation is logged
 CREATE TABLE public.test
@@ -2231,7 +2156,7 @@ CREATE TABLE public.test
 	description TEXT,
 	CONSTRAINT test_pkey PRIMARY KEY (id)
 );
-NOTICE:  AUDIT: SESSION,78,1,DDL,CREATE TABLE,,,"CREATE TABLE public.test
+NOTICE:  AUDIT: SESSION,75,1,DDL,CREATE TABLE,,,"CREATE TABLE public.test
 (
 	id INT,
 	name TEXT,
@@ -2240,20 +2165,23 @@ NOTICE:  AUDIT: SESSION,78,1,DDL,CREATE TABLE,,,"CREATE TABLE public.test
 )",<none>,0
 --
 -- Check that analyze is logged
+-- WHPG: the coordinator samples the segments with gp_acquire_sample_rows(),
+-- which is logged.
 ANALYZE test;
-NOTICE:  AUDIT: SESSION,79,1,MISC,ANALYZE,,,ANALYZE test,<none>,0
+NOTICE:  AUDIT: SESSION,76,1,READ,SELECT,,,"select pg_catalog.gp_acquire_sample_rows(21905, 10000, 'f')",<none>,3
+NOTICE:  AUDIT: SESSION,76,2,MISC,ANALYZE,,,ANALYZE test,<none>,0
 --
 -- Grants to public should not cause object logging (session logging will
 -- still happen)
 GRANT SELECT
   ON TABLE public.test
   TO PUBLIC;
-NOTICE:  AUDIT: SESSION,80,1,ROLE,GRANT,,,"GRANT SELECT
+NOTICE:  AUDIT: SESSION,77,1,ROLE,GRANT,,,"GRANT SELECT
   ON TABLE public.test
   TO PUBLIC",<none>,0
 SELECT *
   FROM test;
-NOTICE:  AUDIT: SESSION,81,1,READ,SELECT,TABLE,public.test,"SELECT *
+NOTICE:  AUDIT: SESSION,78,1,READ,SELECT,TABLE,public.test,"SELECT *
   FROM test",<none>,0
  id | name | description 
 ----+------+-------------
@@ -2262,14 +2190,14 @@ NOTICE:  AUDIT: SESSION,81,1,READ,SELECT,TABLE,public.test,"SELECT *
 -- Check that statements without columns log
 SELECT
   FROM test;
-NOTICE:  AUDIT: SESSION,82,1,READ,SELECT,TABLE,public.test,"SELECT
+NOTICE:  AUDIT: SESSION,79,1,READ,SELECT,TABLE,public.test,"SELECT
   FROM test",<none>,0
 --
 (0 rows)
 
 SELECT 1,
 	   substring('Thomas' from 2 for 3);
-NOTICE:  AUDIT: SESSION,83,1,READ,SELECT,,,"SELECT 1,
+NOTICE:  AUDIT: SESSION,80,1,READ,SELECT,,,"SELECT 1,
 	   substring('Thomas' from 2 for 3)",<none>,1
  ?column? | substring 
 ----------+-----------
@@ -2284,7 +2212,7 @@ BEGIN
 		   substring('Thomas' from 2 for 3)
 	  INTO test;
 END $$;
-NOTICE:  AUDIT: SESSION,84,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,81,1,FUNCTION,DO,,,"DO $$
 DECLARE
 	test INT;
 BEGIN
@@ -2292,11 +2220,11 @@ BEGIN
 		   substring('Thomas' from 2 for 3)
 	  INTO test;
 END $$",<none>,0
-NOTICE:  AUDIT: SESSION,84,2,READ,SELECT,,,"SELECT 1,
+NOTICE:  AUDIT: SESSION,81,2,READ,SELECT,,,"SELECT 1,
 		   substring('Thomas' from 2 for 3)",<none>,1
 explain select 1;
-NOTICE:  AUDIT: SESSION,85,1,READ,SELECT,,,explain select 1,<none>,0
-NOTICE:  AUDIT: SESSION,85,2,MISC,EXPLAIN,,,explain select 1,<none>,0
+NOTICE:  AUDIT: SESSION,82,1,READ,SELECT,,,explain select 1,<none>,0
+NOTICE:  AUDIT: SESSION,82,2,MISC,EXPLAIN,,,explain select 1,<none>,0
                 QUERY PLAN                
 ------------------------------------------
  Result  (cost=0.00..0.01 rows=1 width=4)
@@ -2306,16 +2234,17 @@ NOTICE:  AUDIT: SESSION,85,2,MISC,EXPLAIN,,,explain select 1,<none>,0
 -- Test that looks inside of do blocks log
 INSERT INTO TEST (id)
 		  VALUES (1);
-NOTICE:  AUDIT: SESSION,86,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
+NOTICE:  AUDIT: SESSION,83,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
 		  VALUES (1)",<none>,1
 INSERT INTO TEST (id)
 		  VALUES (2);
-NOTICE:  AUDIT: SESSION,87,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
+NOTICE:  AUDIT: SESSION,84,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
 		  VALUES (2)",<none>,1
 INSERT INTO TEST (id)
 		  VALUES (3);
-NOTICE:  AUDIT: SESSION,88,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
+NOTICE:  AUDIT: SESSION,85,1,WRITE,INSERT,TABLE,public.test,"INSERT INTO TEST (id)
 		  VALUES (3)",<none>,1
+-- WHPG: ORDER BY in the loop query, rows of a distributed table come in any order.
 DO $$
 DECLARE
 	result RECORD;
@@ -2323,31 +2252,34 @@ BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
 	END LOOP;
 END $$;
-NOTICE:  AUDIT: SESSION,89,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,86,1,FUNCTION,DO,,,"DO $$
 DECLARE
 	result RECORD;
 BEGIN
 	FOR result IN
 		SELECT id
 		  FROM test
+		 ORDER BY id
 	LOOP
 		INSERT INTO test (id)
 			 VALUES (result.id + 100);
 	END LOOP;
 END $$",<none>,0
-NOTICE:  AUDIT: SESSION,89,2,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
+NOTICE:  AUDIT: SESSION,86,2,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
 			 VALUES (result.id + 100)",",,1",1
-NOTICE:  AUDIT: SESSION,89,3,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
+NOTICE:  AUDIT: SESSION,86,3,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
 			 VALUES (result.id + 100)",",,2",1
-NOTICE:  AUDIT: SESSION,89,4,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
+NOTICE:  AUDIT: SESSION,86,4,WRITE,INSERT,TABLE,public.test,"INSERT INTO test (id)
 			 VALUES (result.id + 100)",",,3",1
-NOTICE:  AUDIT: SESSION,89,5,READ,SELECT,TABLE,public.test,"SELECT id
-		  FROM test",<none>,3
+NOTICE:  AUDIT: SESSION,86,5,READ,SELECT,TABLE,public.test,"SELECT id
+		  FROM test
+		 ORDER BY id",<none>,3
 --
 -- Test obfuscated dynamic sql for clean logging
 DO $$
@@ -2357,15 +2289,15 @@ BEGIN
 	EXECUTE 'CREATE TABLE ' || table_name || ' ("weird name" INT)';
 	EXECUTE 'DROP table ' || table_name;
 END $$;
-NOTICE:  AUDIT: SESSION,90,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,87,1,FUNCTION,DO,,,"DO $$
 DECLARE
 	table_name TEXT = 'do_table';
 BEGIN
 	EXECUTE 'CREATE TABLE ' || table_name || ' (""weird name"" INT)';
 	EXECUTE 'DROP table ' || table_name;
 END $$",<none>,0
-NOTICE:  AUDIT: SESSION,90,2,DDL,CREATE TABLE,,,"CREATE TABLE do_table (""weird name"" INT)",<none>,0
-NOTICE:  AUDIT: SESSION,90,3,DDL,DROP TABLE,,,DROP table do_table,<none>,0
+NOTICE:  AUDIT: SESSION,87,2,DDL,CREATE TABLE,,,"CREATE TABLE do_table (""weird name"" INT)",<none>,0
+NOTICE:  AUDIT: SESSION,87,3,DDL,DROP TABLE,,,DROP table do_table,<none>,0
 --
 -- Generate an error and make sure the stack gets cleared
 DO $$
@@ -2375,7 +2307,7 @@ BEGIN
 		id INT
 	);
 END $$;
-NOTICE:  AUDIT: SESSION,91,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,88,1,FUNCTION,DO,,,"DO $$
 BEGIN
 	CREATE TABLE bogus.test_block
 	(
@@ -2387,40 +2319,40 @@ ERROR:  schema "bogus" does not exist at character 14
 -- Test alter table statements
 ALTER TABLE public.test
 	DROP COLUMN description ;
-NOTICE:  AUDIT: SESSION,92,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test
+NOTICE:  AUDIT: SESSION,89,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test
 	DROP COLUMN description",<none>,0
 ALTER TABLE public.test
 	RENAME TO test2;
-NOTICE:  AUDIT: SESSION,93,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test
+NOTICE:  AUDIT: SESSION,90,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test
 	RENAME TO test2",<none>,0
 ALTER TABLE public.test2
 	SET SCHEMA test;
-NOTICE:  AUDIT: SESSION,94,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test2
+NOTICE:  AUDIT: SESSION,91,1,DDL,ALTER TABLE,,,"ALTER TABLE public.test2
 	SET SCHEMA test",<none>,0
 ALTER TABLE test.test2
 	ADD COLUMN description TEXT;
-NOTICE:  AUDIT: SESSION,95,1,DDL,ALTER TABLE,,,"ALTER TABLE test.test2
+NOTICE:  AUDIT: SESSION,92,1,DDL,ALTER TABLE,,,"ALTER TABLE test.test2
 	ADD COLUMN description TEXT",<none>,0
 ALTER TABLE test.test2
 	DROP COLUMN description;
-NOTICE:  AUDIT: SESSION,96,1,DDL,ALTER TABLE,,,"ALTER TABLE test.test2
+NOTICE:  AUDIT: SESSION,93,1,DDL,ALTER TABLE,,,"ALTER TABLE test.test2
 	DROP COLUMN description",<none>,0
 DROP TABLE test.test2;
-NOTICE:  AUDIT: SESSION,97,1,DDL,DROP TABLE,,,DROP TABLE test.test2,<none>,0
+NOTICE:  AUDIT: SESSION,94,1,DDL,DROP TABLE,,,DROP TABLE test.test2,<none>,0
 --
 -- Test multiple statements with one semi-colon
 CREATE SCHEMA foo1
 	CREATE TABLE foo1.bar1 (id int)
 	CREATE TABLE foo1.baz1 (id int);
-NOTICE:  AUDIT: SESSION,98,1,DDL,CREATE SCHEMA,,,"CREATE SCHEMA foo1
+NOTICE:  AUDIT: SESSION,95,1,DDL,CREATE SCHEMA,,,"CREATE SCHEMA foo1
 	CREATE TABLE foo1.bar1 (id int)
 	CREATE TABLE foo1.baz1 (id int)",<none>,0
 DROP TABLE foo1.bar1;
-NOTICE:  AUDIT: SESSION,99,1,DDL,DROP TABLE,,,DROP TABLE foo1.bar1,<none>,0
+NOTICE:  AUDIT: SESSION,96,1,DDL,DROP TABLE,,,DROP TABLE foo1.bar1,<none>,0
 DROP TABLE foo1.baz1;
-NOTICE:  AUDIT: SESSION,100,1,DDL,DROP TABLE,,,DROP TABLE foo1.baz1,<none>,0
+NOTICE:  AUDIT: SESSION,97,1,DDL,DROP TABLE,,,DROP TABLE foo1.baz1,<none>,0
 DROP SCHEMA foo1;
-NOTICE:  AUDIT: SESSION,101,1,DDL,DROP SCHEMA,,,DROP SCHEMA foo1,<none>,0
+NOTICE:  AUDIT: SESSION,98,1,DDL,DROP SCHEMA,,,DROP SCHEMA foo1,<none>,0
 --
 -- Test aggregate
 CREATE FUNCTION public.int_add1
@@ -2432,7 +2364,7 @@ CREATE FUNCTION public.int_add1
 BEGIN
 	return a + b;
 END $$;
-NOTICE:  AUDIT: SESSION,102,1,DDL,CREATE FUNCTION,,,"CREATE FUNCTION public.int_add1
+NOTICE:  AUDIT: SESSION,99,1,DDL,CREATE FUNCTION,,,"CREATE FUNCTION public.int_add1
 (
 	a INT,
 	b INT
@@ -2442,43 +2374,43 @@ BEGIN
 	return a + b;
 END $$",<none>,0
 SELECT int_add1(1, 1);
-NOTICE:  AUDIT: SESSION,103,1,FUNCTION,EXECUTE,FUNCTION,public.int_add1,"SELECT int_add1(1, 1)",<none>,0
-NOTICE:  AUDIT: SESSION,103,2,READ,SELECT,,,"SELECT int_add1(1, 1)",<none>,1
+NOTICE:  AUDIT: SESSION,100,1,FUNCTION,EXECUTE,FUNCTION,public.int_add1,"SELECT int_add1(1, 1)",<none>,0
+NOTICE:  AUDIT: SESSION,100,2,READ,SELECT,,,"SELECT int_add1(1, 1)",<none>,1
  int_add1 
 ----------
         2
 (1 row)
 
 CREATE AGGREGATE public.sum_test(INT) (SFUNC=public.int_add1, STYPE=INT, INITCOND='0');
-NOTICE:  AUDIT: SESSION,104,1,DDL,CREATE AGGREGATE,,,"CREATE AGGREGATE public.sum_test(INT) (SFUNC=public.int_add1, STYPE=INT, INITCOND='0')",<none>,0
+NOTICE:  AUDIT: SESSION,101,1,DDL,CREATE AGGREGATE,,,"CREATE AGGREGATE public.sum_test(INT) (SFUNC=public.int_add1, STYPE=INT, INITCOND='0')",<none>,0
 ALTER AGGREGATE public.sum_test(integer) RENAME TO sum_test3;
-NOTICE:  AUDIT: SESSION,105,1,DDL,ALTER AGGREGATE,,,ALTER AGGREGATE public.sum_test(integer) RENAME TO sum_test3,<none>,0
+NOTICE:  AUDIT: SESSION,102,1,DDL,ALTER AGGREGATE,,,ALTER AGGREGATE public.sum_test(integer) RENAME TO sum_test3,<none>,0
 --
 -- Test conversion
 CREATE CONVERSION public.conversion_test FOR 'latin1' TO 'utf8' FROM pg_catalog.iso8859_1_to_utf8;
-NOTICE:  AUDIT: SESSION,106,1,DDL,CREATE CONVERSION,,,CREATE CONVERSION public.conversion_test FOR 'latin1' TO 'utf8' FROM pg_catalog.iso8859_1_to_utf8,<none>,0
+NOTICE:  AUDIT: SESSION,103,1,DDL,CREATE CONVERSION,,,CREATE CONVERSION public.conversion_test FOR 'latin1' TO 'utf8' FROM pg_catalog.iso8859_1_to_utf8,<none>,0
 ALTER CONVERSION public.conversion_test RENAME TO conversion_test3;
-NOTICE:  AUDIT: SESSION,107,1,DDL,ALTER CONVERSION,,,ALTER CONVERSION public.conversion_test RENAME TO conversion_test3,<none>,0
+NOTICE:  AUDIT: SESSION,104,1,DDL,ALTER CONVERSION,,,ALTER CONVERSION public.conversion_test RENAME TO conversion_test3,<none>,0
 --
 -- Test create/alter/drop database
 CREATE DATABASE contrib_regression_pgaudit;
-NOTICE:  AUDIT: SESSION,108,1,DDL,CREATE DATABASE,,,CREATE DATABASE contrib_regression_pgaudit,<none>,0
+NOTICE:  AUDIT: SESSION,105,1,DDL,CREATE DATABASE,,,CREATE DATABASE contrib_regression_pgaudit,<none>,0
 ALTER DATABASE contrib_regression_pgaudit RENAME TO contrib_regression_pgaudit2;
-NOTICE:  AUDIT: SESSION,109,1,DDL,ALTER DATABASE,,,ALTER DATABASE contrib_regression_pgaudit RENAME TO contrib_regression_pgaudit2,<none>,0
+NOTICE:  AUDIT: SESSION,106,1,DDL,ALTER DATABASE,,,ALTER DATABASE contrib_regression_pgaudit RENAME TO contrib_regression_pgaudit2,<none>,0
 DROP DATABASE contrib_regression_pgaudit2;
-NOTICE:  AUDIT: SESSION,110,1,DDL,DROP DATABASE,,,DROP DATABASE contrib_regression_pgaudit2,<none>,0
+NOTICE:  AUDIT: SESSION,107,1,DDL,DROP DATABASE,,,DROP DATABASE contrib_regression_pgaudit2,<none>,0
 -- Test role as a substmt
 SET pgaudit.log = 'role';
 CREATE TABLE t ();
 CREATE ROLE regress_alice;
-NOTICE:  AUDIT: SESSION,111,1,ROLE,CREATE ROLE,,,CREATE ROLE regress_alice,<none>,0
+NOTICE:  AUDIT: SESSION,108,1,ROLE,CREATE ROLE,,,CREATE ROLE regress_alice,<none>,0
 CREATE SCHEMA foo3
 	GRANT SELECT
 	   ON public.t
 	   TO regress_alice;
 drop table public.t;
 drop role regress_alice;
-NOTICE:  AUDIT: SESSION,112,1,ROLE,DROP ROLE,,,drop role regress_alice,<none>,0
+NOTICE:  AUDIT: SESSION,109,1,ROLE,DROP ROLE,,,drop role regress_alice,<none>,0
 --
 -- Test for non-empty stack error
 CREATE OR REPLACE FUNCTION get_test_id(_ret REFCURSOR) RETURNS REFCURSOR
@@ -2518,7 +2450,7 @@ END;
 --
 -- Test that frees a memory context earlier than expected
 SET pgaudit.log = 'all';
-NOTICE:  AUDIT: SESSION,113,1,MISC,SET,,,SET pgaudit.log = 'all',<none>,0
+NOTICE:  AUDIT: SESSION,110,1,MISC,SET,,,SET pgaudit.log = 'all',<none>,0
 CREATE FUNCTION test1()
 	RETURNS INT AS $$
 DECLARE
@@ -2530,7 +2462,7 @@ BEGIN
 	RETURN tmp;
 END $$
 LANGUAGE plpgsql ;
-NOTICE:  AUDIT: SESSION,114,1,DDL,CREATE FUNCTION,,,"CREATE FUNCTION test1()
+NOTICE:  AUDIT: SESSION,111,1,DDL,CREATE FUNCTION,,,"CREATE FUNCTION test1()
 	RETURNS INT AS $$
 DECLARE
 	cur1 cursor for select * from hoge;
@@ -2542,8 +2474,8 @@ BEGIN
 END $$
 LANGUAGE plpgsql",<none>,0
 SELECT test1();
-NOTICE:  AUDIT: SESSION,115,1,FUNCTION,EXECUTE,FUNCTION,public.test1,SELECT test1(),<none>,0
-NOTICE:  AUDIT: SESSION,115,2,READ,SELECT,,,SELECT test1(),<none>,1
+NOTICE:  AUDIT: SESSION,112,1,FUNCTION,EXECUTE,FUNCTION,public.test1,SELECT test1(),<none>,0
+NOTICE:  AUDIT: SESSION,112,2,READ,SELECT,,,SELECT test1(),<none>,1
  test1 
 -------
       
@@ -2562,20 +2494,20 @@ grant delete
    to regress_auditor;
 insert into bar (col)
 		 values (1);
-NOTICE:  AUDIT: SESSION,116,1,WRITE,INSERT,TABLE,public.bar,"insert into bar (col)
+NOTICE:  AUDIT: SESSION,113,1,WRITE,INSERT,TABLE,public.bar,"insert into bar (col)
 		 values (1)",<none>,1
 delete from bar;
-NOTICE:  AUDIT: OBJECT,117,1,WRITE,DELETE,TABLE,public.bar,delete from bar,<none>,1
-NOTICE:  AUDIT: SESSION,117,1,WRITE,DELETE,TABLE,public.bar,delete from bar,<none>,1
+NOTICE:  AUDIT: OBJECT,114,1,WRITE,DELETE,TABLE,public.bar,delete from bar,<none>,1
+NOTICE:  AUDIT: SESSION,114,1,WRITE,DELETE,TABLE,public.bar,delete from bar,<none>,1
 insert into bar (col)
 		 values (1);
-NOTICE:  AUDIT: SESSION,118,1,WRITE,INSERT,TABLE,public.bar,"insert into bar (col)
+NOTICE:  AUDIT: SESSION,115,1,WRITE,INSERT,TABLE,public.bar,"insert into bar (col)
 		 values (1)",<none>,1
 delete from bar
  where col = 1;
-NOTICE:  AUDIT: OBJECT,119,1,WRITE,DELETE,TABLE,public.bar,"delete from bar
+NOTICE:  AUDIT: OBJECT,116,1,WRITE,DELETE,TABLE,public.bar,"delete from bar
  where col = 1",<none>,1
-NOTICE:  AUDIT: SESSION,119,1,WRITE,DELETE,TABLE,public.bar,"delete from bar
+NOTICE:  AUDIT: SESSION,116,1,WRITE,DELETE,TABLE,public.bar,"delete from bar
  where col = 1",<none>,1
 drop table bar;
 --
@@ -2607,128 +2539,132 @@ GRANT UPDATE
    ON bbb
    TO regress_auditor;
 INSERT INTO aaa VALUES (generate_series(1,100));
-NOTICE:  AUDIT: SESSION,120,1,WRITE,INSERT,TABLE,public.aaa,"INSERT INTO aaa VALUES (generate_series(1,100))",<none>,100
+NOTICE:  AUDIT: SESSION,117,1,WRITE,INSERT,TABLE,public.aaa,"INSERT INTO aaa VALUES (generate_series(1,100))",<none>,100
 SET pgaudit.log_parameter TO OFF;
+-- WHPG: the trigger on bbb runs an UPDATE, which cannot run on a segment in
+-- WarehousePG, so the insert fails.
 INSERT INTO bbb VALUES (1);
-NOTICE:  AUDIT: OBJECT,121,1,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,<not logged>,1
-NOTICE:  AUDIT: SESSION,121,1,WRITE,UPDATE,TABLE,public.bbb,UPDATE bbb set id = new.id + 1,<not logged>,1
-NOTICE:  AUDIT: SESSION,121,2,WRITE,INSERT,TABLE,public.bbb,INSERT INTO bbb VALUES (1),<not logged>,1
+ERROR:  function cannot execute on a QE slice because it issues a non-SELECT statement
 SET pgaudit.log_parameter TO ON;
 DROP TABLE bbb;
 DROP TABLE aaa;
 --
 -- Test MISC
 SET pgaudit.log = 'misc';
-NOTICE:  AUDIT: SESSION,122,1,MISC,SET,,,SET pgaudit.log = 'misc',<none>,0
+NOTICE:  AUDIT: SESSION,118,1,MISC,SET,,,SET pgaudit.log = 'misc',<none>,0
 SET pgaudit.log_client = on;
-NOTICE:  AUDIT: SESSION,123,1,MISC,SET,,,SET pgaudit.log_client = on,<none>,0
+NOTICE:  AUDIT: SESSION,119,1,MISC,SET,,,SET pgaudit.log_client = on,<none>,0
 SET pgaudit.log_relation = on;
-NOTICE:  AUDIT: SESSION,124,1,MISC,SET,,,SET pgaudit.log_relation = on,<none>,0
+NOTICE:  AUDIT: SESSION,120,1,MISC,SET,,,SET pgaudit.log_relation = on,<none>,0
 SET pgaudit.log_parameter = on;
-NOTICE:  AUDIT: SESSION,125,1,MISC,SET,,,SET pgaudit.log_parameter = on,<none>,0
+NOTICE:  AUDIT: SESSION,121,1,MISC,SET,,,SET pgaudit.log_parameter = on,<none>,0
 CREATE ROLE regress_alice;
 SET ROLE regress_alice;
-NOTICE:  AUDIT: SESSION,126,1,MISC,SET,,,SET ROLE regress_alice,<none>,0
+NOTICE:  AUDIT: SESSION,122,1,MISC,SET,,,SET ROLE regress_alice,<none>,0
 CREATE TABLE t (a int, b text);
 SET search_path TO test, public;
-NOTICE:  AUDIT: SESSION,127,1,MISC,SET,,,"SET search_path TO test, public",<none>,0
+NOTICE:  AUDIT: SESSION,123,1,MISC,SET,,,"SET search_path TO test, public",<none>,0
 INSERT INTO t VALUES (1, 'misc');
 VACUUM t;
-NOTICE:  AUDIT: SESSION,128,1,MISC,VACUUM,,,VACUUM t,<none>,0
+NOTICE:  AUDIT: SESSION,124,1,MISC,VACUUM,,,VACUUM t,<none>,0
 RESET ROLE;
-NOTICE:  AUDIT: SESSION,129,1,MISC,RESET,,,RESET ROLE,<none>,0
+NOTICE:  AUDIT: SESSION,125,1,MISC,RESET,,,RESET ROLE,<none>,0
 --
 -- Test MISC_SET
 SET pgaudit.log = 'MISC_SET';
-NOTICE:  AUDIT: SESSION,130,1,MISC,SET,,,SET pgaudit.log = 'MISC_SET',<none>,0
+NOTICE:  AUDIT: SESSION,126,1,MISC,SET,,,SET pgaudit.log = 'MISC_SET',<none>,0
 SET ROLE regress_alice;
-NOTICE:  AUDIT: SESSION,131,1,MISC,SET,,,SET ROLE regress_alice,<none>,0
+NOTICE:  AUDIT: SESSION,127,1,MISC,SET,,,SET ROLE regress_alice,<none>,0
 SET search_path TO public;
-NOTICE:  AUDIT: SESSION,132,1,MISC,SET,,,SET search_path TO public,<none>,0
+NOTICE:  AUDIT: SESSION,128,1,MISC,SET,,,SET search_path TO public,<none>,0
 INSERT INTO t VALUES (2, 'misc_set');
 VACUUM t;
 RESET ROLE;
-NOTICE:  AUDIT: SESSION,133,1,MISC,RESET,,,RESET ROLE,<none>,0
+NOTICE:  AUDIT: SESSION,129,1,MISC,RESET,,,RESET ROLE,<none>,0
 --
 -- Test ALL, -MISC, MISC_SET
 SET pgaudit.log = 'ALL, -MISC, MISC_SET';
-NOTICE:  AUDIT: SESSION,134,1,MISC,SET,,,"SET pgaudit.log = 'ALL, -MISC, MISC_SET'",<none>,0
+NOTICE:  AUDIT: SESSION,130,1,MISC,SET,,,"SET pgaudit.log = 'ALL, -MISC, MISC_SET'",<none>,0
 SET search_path TO public;
-NOTICE:  AUDIT: SESSION,135,1,MISC,SET,,,SET search_path TO public,<none>,0
+NOTICE:  AUDIT: SESSION,131,1,MISC,SET,,,SET search_path TO public,<none>,0
 INSERT INTO t VALUES (3, 'all, -misc, misc_set');
-NOTICE:  AUDIT: SESSION,136,1,WRITE,INSERT,TABLE,public.t,"INSERT INTO t VALUES (3, 'all, -misc, misc_set')",<none>,1
+NOTICE:  AUDIT: SESSION,132,1,WRITE,INSERT,TABLE,public.t,"INSERT INTO t VALUES (3, 'all, -misc, misc_set')",<none>,1
 VACUUM t;
 RESET ROLE;
-NOTICE:  AUDIT: SESSION,137,1,MISC,RESET,,,RESET ROLE,<none>,0
+NOTICE:  AUDIT: SESSION,133,1,MISC,RESET,,,RESET ROLE,<none>,0
 DROP TABLE public.t;
-NOTICE:  AUDIT: SESSION,138,1,DDL,DROP TABLE,,,DROP TABLE public.t,<none>,0
+NOTICE:  AUDIT: SESSION,134,1,DDL,DROP TABLE,,,DROP TABLE public.t,<none>,0
 DROP ROLE regress_alice;
-NOTICE:  AUDIT: SESSION,139,1,ROLE,DROP ROLE,,,DROP ROLE regress_alice,<none>,0
+NOTICE:  AUDIT: SESSION,135,1,ROLE,DROP ROLE,,,DROP ROLE regress_alice,<none>,0
 --
 -- Test PARTITIONED table
 CREATE TABLE h(x int ,y int) PARTITION BY HASH(x);
-NOTICE:  AUDIT: SESSION,140,1,DDL,CREATE TABLE,,,"CREATE TABLE h(x int ,y int) PARTITION BY HASH(x)",<none>,0
+NOTICE:  AUDIT: SESSION,136,1,DDL,CREATE TABLE,,,"CREATE TABLE h(x int ,y int) PARTITION BY HASH(x)",<none>,0
 CREATE TABLE h_0 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 0);
-NOTICE:  AUDIT: SESSION,141,1,DDL,CREATE TABLE,,,"CREATE TABLE h_0 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 0)",<none>,0
+NOTICE:  AUDIT: SESSION,137,1,DDL,CREATE TABLE,,,"CREATE TABLE h_0 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 0)",<none>,0
 CREATE TABLE h_1 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 1);
-NOTICE:  AUDIT: SESSION,142,1,DDL,CREATE TABLE,,,"CREATE TABLE h_1 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 1)",<none>,0
+NOTICE:  AUDIT: SESSION,138,1,DDL,CREATE TABLE,,,"CREATE TABLE h_1 partition OF h FOR VALUES WITH ( MODULUS 2, REMAINDER 1)",<none>,0
 INSERT INTO h VALUES(1,1);
-NOTICE:  AUDIT: SESSION,143,1,WRITE,INSERT,TABLE,public.h,"INSERT INTO h VALUES(1,1)",<none>,1
+NOTICE:  AUDIT: SESSION,139,1,WRITE,INSERT,TABLE,public.h,"INSERT INTO h VALUES(1,1)",<none>,1
 SELECT * FROM h;
-NOTICE:  AUDIT: SESSION,144,1,READ,SELECT,TABLE,public.h,SELECT * FROM h,<none>,1
+NOTICE:  AUDIT: SESSION,140,1,READ,SELECT,TABLE,public.h,SELECT * FROM h,<none>,1
  x | y 
 ---+---
  1 | 1
 (1 row)
 
 SELECT * FROM h_0;
-NOTICE:  AUDIT: SESSION,145,1,READ,SELECT,TABLE,public.h_0,SELECT * FROM h_0,<none>,1
+NOTICE:  AUDIT: SESSION,141,1,READ,SELECT,TABLE,public.h_0,SELECT * FROM h_0,<none>,1
  x | y 
 ---+---
  1 | 1
 (1 row)
 
 COPY h FROM stdin;
-NOTICE:  AUDIT: SESSION,146,1,WRITE,COPY,TABLE,public.h,COPY h FROM stdin,<none>,2
+NOTICE:  AUDIT: SESSION,142,1,WRITE,COPY,TABLE,public.h,COPY h FROM stdin,<none>,2
+-- WHPG: the rows come back segment by segment, not in insert order.
 COPY h TO stdout;
+2	2
+1	1
+3	3
+NOTICE:  AUDIT: SESSION,143,1,READ,COPY,TABLE,public.h,COPY h TO stdout,<none>,3
+-- WHPG: ORDER BY, rows of a distributed table come in any order.
+COPY (SELECT * FROM h ORDER BY x) TO stdout;
 1	1
 2	2
 3	3
-NOTICE:  AUDIT: SESSION,147,1,READ,COPY,TABLE,public.h,COPY h TO stdout,<none>,3
-COPY (SELECT * FROM h) TO stdout;
-1	1
-2	2
-3	3
-NOTICE:  AUDIT: SESSION,148,1,READ,SELECT,TABLE,public.h,COPY (SELECT * FROM h) TO stdout,<none>,3
-NOTICE:  AUDIT: SESSION,148,2,READ,COPY,,,COPY (SELECT * FROM h) TO stdout,<none>,3
+NOTICE:  AUDIT: SESSION,144,1,READ,SELECT,TABLE,public.h,COPY (SELECT * FROM h ORDER BY x) TO stdout,<none>,3
+NOTICE:  AUDIT: SESSION,144,2,READ,COPY,,,COPY (SELECT * FROM h ORDER BY x) TO stdout,<none>,3
 CREATE INDEX h_idx ON h (x);
-NOTICE:  AUDIT: SESSION,149,1,DDL,CREATE INDEX,,,CREATE INDEX h_idx ON h (x),<none>,0
+NOTICE:  AUDIT: SESSION,145,1,DDL,CREATE INDEX,,,CREATE INDEX h_idx ON h (x),<none>,0
 DROP INDEX h_idx;
-NOTICE:  AUDIT: SESSION,150,1,DDL,DROP INDEX,,,DROP INDEX h_idx,<none>,0
+NOTICE:  AUDIT: SESSION,146,1,DDL,DROP INDEX,,,DROP INDEX h_idx,<none>,0
 DROP TABLE h;
-NOTICE:  AUDIT: SESSION,151,1,DDL,DROP TABLE,,,DROP TABLE h,<none>,0
+NOTICE:  AUDIT: SESSION,147,1,DDL,DROP TABLE,,,DROP TABLE h,<none>,0
 --
 -- Test that FK checks made by the RI fast path are not logged against the
 -- statement.  Since PostgreSQL 19 the fast path checks permissions from the FK
 -- trigger, which runs after the statement's own check or, when the constraint
 -- is deferred, at SET CONSTRAINTS ... IMMEDIATE or COMMIT, including a COMMIT
 -- made by a procedure or DO block.
+-- WHPG: WarehousePG creates foreign key triggers disabled, so no FK check runs
+-- and this block does not reach the RI fast path.
 CREATE TABLE ri_pk (id int PRIMARY KEY);
-NOTICE:  AUDIT: SESSION,152,1,DDL,CREATE TABLE,,,CREATE TABLE ri_pk (id int PRIMARY KEY),<none>,0
+NOTICE:  AUDIT: SESSION,148,1,DDL,CREATE TABLE,,,CREATE TABLE ri_pk (id int PRIMARY KEY),<none>,0
 CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE);
-NOTICE:  AUDIT: SESSION,153,1,DDL,CREATE TABLE,,,CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE),<none>,0
+NOTICE:  AUDIT: SESSION,149,1,DDL,CREATE TABLE,,,CREATE TABLE ri_fk (id int REFERENCES ri_pk (id) DEFERRABLE),<none>,0
 INSERT INTO ri_pk VALUES (1), (2);
-NOTICE:  AUDIT: SESSION,154,1,WRITE,INSERT,TABLE,public.ri_pk,"INSERT INTO ri_pk VALUES (1), (2)",<none>,2
+NOTICE:  AUDIT: SESSION,150,1,WRITE,INSERT,TABLE,public.ri_pk,"INSERT INTO ri_pk VALUES (1), (2)",<none>,2
 INSERT INTO ri_fk VALUES (1), (2);
-NOTICE:  AUDIT: SESSION,155,1,WRITE,INSERT,TABLE,public.ri_fk,"INSERT INTO ri_fk VALUES (1), (2)",<none>,2
+NOTICE:  AUDIT: SESSION,151,1,WRITE,INSERT,TABLE,public.ri_fk,"INSERT INTO ri_fk VALUES (1), (2)",<none>,2
 BEGIN;
 SET CONSTRAINTS ALL DEFERRED;
 INSERT INTO ri_fk VALUES (1), (2);
-NOTICE:  AUDIT: SESSION,156,1,WRITE,INSERT,TABLE,public.ri_fk,"INSERT INTO ri_fk VALUES (1), (2)",<none>,2
+NOTICE:  AUDIT: SESSION,152,1,WRITE,INSERT,TABLE,public.ri_fk,"INSERT INTO ri_fk VALUES (1), (2)",<none>,2
 SET CONSTRAINTS ALL IMMEDIATE;
 COMMIT;
 COPY ri_fk FROM stdin;
-NOTICE:  AUDIT: SESSION,157,1,WRITE,COPY,TABLE,public.ri_fk,COPY ri_fk FROM stdin,<none>,2
+NOTICE:  AUDIT: SESSION,153,1,WRITE,COPY,TABLE,public.ri_fk,COPY ri_fk FROM stdin,<none>,2
 CREATE PROCEDURE ri_proc() LANGUAGE plpgsql AS $$
 BEGIN
 	SET CONSTRAINTS ALL DEFERRED;
@@ -2736,7 +2672,7 @@ BEGIN
 	COMMIT;
 	INSERT INTO ri_fk VALUES (2);
 END $$;
-NOTICE:  AUDIT: SESSION,158,1,DDL,CREATE PROCEDURE,,,"CREATE PROCEDURE ri_proc() LANGUAGE plpgsql AS $$
+NOTICE:  AUDIT: SESSION,154,1,DDL,CREATE PROCEDURE,,,"CREATE PROCEDURE ri_proc() LANGUAGE plpgsql AS $$
 BEGIN
 	SET CONSTRAINTS ALL DEFERRED;
 	INSERT INTO ri_fk VALUES (1);
@@ -2744,28 +2680,28 @@ BEGIN
 	INSERT INTO ri_fk VALUES (2);
 END $$",<none>,0
 CALL ri_proc();
-NOTICE:  AUDIT: SESSION,159,1,FUNCTION,EXECUTE,FUNCTION,public.ri_proc,CALL ri_proc(),<none>,0
-NOTICE:  AUDIT: SESSION,159,2,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (1),<none>,1
-NOTICE:  AUDIT: SESSION,159,3,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (2),<none>,1
+NOTICE:  AUDIT: SESSION,155,1,FUNCTION,EXECUTE,FUNCTION,public.ri_proc,CALL ri_proc(),<none>,0
+NOTICE:  AUDIT: SESSION,155,2,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (1),<none>,1
+NOTICE:  AUDIT: SESSION,155,3,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (2),<none>,1
 DO $$
 BEGIN
 	SET CONSTRAINTS ALL DEFERRED;
 	INSERT INTO ri_fk VALUES (1);
 	COMMIT;
 END $$;
-NOTICE:  AUDIT: SESSION,160,1,FUNCTION,DO,,,"DO $$
+NOTICE:  AUDIT: SESSION,156,1,FUNCTION,DO,,,"DO $$
 BEGIN
 	SET CONSTRAINTS ALL DEFERRED;
 	INSERT INTO ri_fk VALUES (1);
 	COMMIT;
 END $$",<none>,0
-NOTICE:  AUDIT: SESSION,160,2,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (1),<none>,1
+NOTICE:  AUDIT: SESSION,156,2,WRITE,INSERT,TABLE,public.ri_fk,INSERT INTO ri_fk VALUES (1),<none>,1
 DROP PROCEDURE ri_proc();
-NOTICE:  AUDIT: SESSION,161,1,DDL,DROP PROCEDURE,,,DROP PROCEDURE ri_proc(),<none>,0
+NOTICE:  AUDIT: SESSION,157,1,DDL,DROP PROCEDURE,,,DROP PROCEDURE ri_proc(),<none>,0
 DROP TABLE ri_fk;
-NOTICE:  AUDIT: SESSION,162,1,DDL,DROP TABLE,,,DROP TABLE ri_fk,<none>,0
+NOTICE:  AUDIT: SESSION,158,1,DDL,DROP TABLE,,,DROP TABLE ri_fk,<none>,0
 DROP TABLE ri_pk;
-NOTICE:  AUDIT: SESSION,163,1,DDL,DROP TABLE,,,DROP TABLE ri_pk,<none>,0
+NOTICE:  AUDIT: SESSION,159,1,DDL,DROP TABLE,,,DROP TABLE ri_pk,<none>,0
 --
 -- Test DDL logged by the event triggers.  The extension was dropped before the
 -- log_rows tests so the DDL above is logged without the event triggers.  The
@@ -2774,15 +2710,15 @@ NOTICE:  AUDIT: SESSION,163,1,DDL,DROP TABLE,,,DROP TABLE ri_pk,<none>,0
 -- statement's stack item.  Both event triggers are covered, i.e.
 -- ddl_command_end for CREATE and ALTER and sql_drop for DROP.
 CREATE EXTENSION pgaudit;
-NOTICE:  AUDIT: SESSION,164,1,DDL,CREATE EXTENSION,,,CREATE EXTENSION pgaudit,<none>,0
+NOTICE:  AUDIT: SESSION,160,1,DDL,CREATE EXTENSION,,,CREATE EXTENSION pgaudit,<none>,0
 CREATE TABLE ddl_rows (id int);
-NOTICE:  AUDIT: SESSION,165,1,DDL,CREATE TABLE,TABLE,public.ddl_rows,CREATE TABLE ddl_rows (id int),<none>,0
+NOTICE:  AUDIT: SESSION,161,1,DDL,CREATE TABLE,TABLE,public.ddl_rows,CREATE TABLE ddl_rows (id int),<none>,0
 ALTER TABLE ddl_rows ADD COLUMN name text;
-NOTICE:  AUDIT: SESSION,166,1,DDL,ALTER TABLE,TABLE,public.ddl_rows,ALTER TABLE ddl_rows ADD COLUMN name text,<none>,0
+NOTICE:  AUDIT: SESSION,162,1,DDL,ALTER TABLE,TABLE,public.ddl_rows,ALTER TABLE ddl_rows ADD COLUMN name text,<none>,0
 DROP TABLE ddl_rows;
-NOTICE:  AUDIT: SESSION,167,1,DDL,DROP TABLE,TABLE,public.ddl_rows,DROP TABLE ddl_rows,<none>,0
+NOTICE:  AUDIT: SESSION,163,1,DDL,DROP TABLE,TABLE,public.ddl_rows,DROP TABLE ddl_rows,<none>,0
 DROP EXTENSION pgaudit;
-NOTICE:  AUDIT: SESSION,168,1,DDL,DROP EXTENSION,,,DROP EXTENSION pgaudit,<none>,0
+NOTICE:  AUDIT: SESSION,164,1,DDL,DROP EXTENSION,,,DROP EXTENSION pgaudit,<none>,0
 --
 -- Change configuration of user 1 so that full statements are not logged
 \connect - :current_user
@@ -2840,9 +2776,10 @@ SET pgaudit.log = 'all,-misc_set';
 SET pgaudit.log_level = 'warning';
 CREATE EXTENSION pg_stat_statements;
 WARNING:  AUDIT: SESSION,3,1,DDL,CREATE EXTENSION,,,CREATE EXTENSION pg_stat_statements,<not logged>
-ALTER EXTENSION pg_stat_statements UPDATE TO '1.13';
-WARNING:  AUDIT: SESSION,4,1,DDL,ALTER EXTENSION,,,ALTER EXTENSION pg_stat_statements UPDATE TO '1.13',<not logged>
-NOTICE:  version "1.13" of extension "pg_stat_statements" is already installed
+-- WHPG: WarehousePG ships pg_stat_statements 1.13.1.
+ALTER EXTENSION pg_stat_statements UPDATE TO '1.13.1';
+WARNING:  AUDIT: SESSION,4,1,DDL,ALTER EXTENSION,,,ALTER EXTENSION pg_stat_statements UPDATE TO '1.13.1',<not logged>
+NOTICE:  version "1.13.1" of extension "pg_stat_statements" is already installed
 DROP EXTENSION pg_stat_statements;
 WARNING:  AUDIT: SESSION,5,1,DDL,DROP EXTENSION,,,DROP EXTENSION pg_stat_statements,<not logged>
 SET pgaudit.log_level = 'notice';
