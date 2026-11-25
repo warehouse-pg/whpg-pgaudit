@@ -17,6 +17,13 @@ s/Result\s+\(cost=[\d.]+\.\.[\d.]+ rows=\d+ width=\d+\)/Result  (cost=0.00..0.00
 -- end_matchsubs
 
 -- start_matchignore
-# Ignore ORCA optimizer line in EXPLAIN output
+# Ignore the optimizer line in EXPLAIN output
 m/^\s*Optimizer: GPORCA/
+m/^\s*Optimizer: Postgres-based planner/
+# WarehousePG does not enforce foreign keys
+m/^WARNING:  referential integrity \(FOREIGN KEY\) constraints are not supported in Greenplum Database, will not be enforced/
+# A partition takes its distribution key from its parent
+m/^NOTICE:  table has parent, setting distribution columns to match parent table/
+# Every segment repeats the coordinator's warning
+m/^WARNING:  setting an MD5-encrypted password  \(seg\d+ .*/
 -- end_matchignore
