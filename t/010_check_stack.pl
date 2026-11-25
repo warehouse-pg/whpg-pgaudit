@@ -154,7 +154,11 @@ sub pg_connect
     $sock->autoflush(1);
     binmode($sock);
 
-    print $sock startup_msg(user => $user, database => 'postgres');
+    # WHPG: a test node only accepts utility mode connections.
+    print $sock startup_msg(
+        user => $user,
+        database => 'postgres',
+        options => '-c gp_role=utility');
     read_until_ready($sock);
 
     return $sock;
@@ -162,7 +166,8 @@ sub pg_connect
 
 # Bring up a single node with pgaudit
 #-------------------------------------------------------------------------------
-my $node = PostgreSQL::Test::Cluster->new('audit');
+# WHPG: a coordinator node, pgaudit is not active on a segment.
+my $node = PostgreSQL::Test::Cluster->new('audit', coordinator => 1);
 
 $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'pgaudit'");
