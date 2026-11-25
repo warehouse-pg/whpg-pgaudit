@@ -42,6 +42,11 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
+/* WHPG PATCH Starts */
+#include "cdb/cdbvars.h"
+#include "pgaudit_orca.h"
+/* WHPG PATCH Ends */
+
 PG_MODULE_MAGIC_EXT(.name = "pgaudit", .version = PGAUDIT_VERSION);
 
 void _PG_init(void);
@@ -1151,8 +1156,16 @@ log_select_dml(Oid auditOid, List *rangeTabls, List *permInfos)
          * relkind and perminfoindex so permissions on the view are still
          * checked here.
          */
+/* WHPG PATCH Starts */
+        /*
+         * The WarehousePG planner wipes the RTE of a pulled-up view to
+         * RTE_VOID but keeps its relkind and perminfoindex, so accept RTE_VOID
+         * as ExecCheckPermissions() does.
+         */
         Assert(rte->rtekind == RTE_RELATION ||
-               (rte->rtekind == RTE_SUBQUERY && rte->relkind == RELKIND_VIEW));
+               (rte->rtekind == RTE_SUBQUERY && rte->relkind == RELKIND_VIEW) ||
+               rte->rtekind == RTE_VOID);
+/* WHPG PATCH Ends */
 
         found = true;
 
@@ -1586,6 +1599,41 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls,
      */
     bool ownCheck = auditEventStack != NULL &&
                     auditEventStack->auditEvent.permsPending;
+
+/* WHPG PATCH Starts */
+    /*
+     * ORCA compatibility: capture rtable during planning, use cached during
+     * execution.  orca_resolve_rtable() handles both cases:
+     * - During planning: captures rangeTabls, returns false
+     * - During execution: returns true and the cached data on a hit
+     */
+    {
+        List *cached_rtable = NIL;
+        List *cached_perminfos = NIL;
+
+        if (orca_resolve_rtable(rangeTabls, permInfos,
+                                &cached_rtable, &cached_perminfos))
+        {
+            rangeTabls = cached_rtable;
+            permInfos = cached_perminfos;
+        }
+    }
+
+    /*
+     * Skip logging if we're in ORCA planner context. ORCA calls
+     * ExecCheckPermissions during planning, but we only want to log during
+     * actual execution.  A planning-time check is never the top stack item's
+     * own check, so leave permsPending for the check made at execution.
+     */
+    if (orca_in_planner())
+    {
+        if (next_ExecutorCheckPerms_hook &&
+            !(*next_ExecutorCheckPerms_hook)(rangeTabls, permInfos,
+                                             ereport_on_violation))
+            return false;
+        return true;
+    }
+/* WHPG PATCH Ends */
 
     if (ownCheck)
         auditEventStack->auditEvent.permsPending = false;
@@ -2289,10 +2337,27 @@ _PG_init(void)
     if (inited)
         return;
 
+/* WHPG PATCH Starts */
+    /* In WarehousePG, only run on the query dispatcher (coordinator) */
+    if (!IS_QUERY_DISPATCHER())
+    {
+        return;
+    }
+/* WHPG PATCH Ends */
+
     /* Must be loaded with shared_preload_libraries */
     if (!process_shared_preload_libraries_in_progress)
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("pgaudit must be loaded via shared_preload_libraries")));
+
+/* WHPG PATCH Starts */
+    /*
+     * Initialize ORCA compatibility layer.  It installs hooks, so it must come
+     * after the check above: a load that fails is not remembered and may be
+     * tried again, which would install the hooks a second time.
+     */
+    orca_init();
+/* WHPG PATCH Ends */
 
     /* Define pgaudit.log */
     DefineCustomStringVariable(
