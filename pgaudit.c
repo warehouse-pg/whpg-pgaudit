@@ -1704,6 +1704,24 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls,
                     auditEventStack->auditEvent.auditOid = auditOid;
                     auditEventStack->auditEvent.rangeTabls = copyObject(rangeTabls);
                     auditEventStack->auditEvent.permInfos = copyObject(permInfos);
+
+/* WHPG PATCH Starts */
+                    /*
+                     * A GPORCA plan for a statement without relations has an
+                     * empty range table, where the Postgres planner adds an
+                     * RTE_RESULT entry.  Since a saved rangeTabls is what marks
+                     * the audit entry as deferred, save that entry instead of
+                     * an empty list or the audit entry would be lost.
+                     */
+                    if (auditEventStack->auditEvent.rangeTabls == NIL)
+                    {
+                        RangeTblEntry *rte = makeNode(RangeTblEntry);
+
+                        rte->rtekind = RTE_RESULT;
+                        auditEventStack->auditEvent.rangeTabls = list_make1(rte);
+                    }
+/* WHPG PATCH Ends */
+
                     MemoryContextSwitchTo(contextOld);
                 }
             }
