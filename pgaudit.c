@@ -1615,11 +1615,17 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls,
                     auditEventStack->auditEvent.permsPending;
 
 /* WHPG PATCH Starts */
+    /* The lists as passed by the caller, which the next hook gets */
+    List *callerRangeTabls = rangeTabls;
+    List *callerPermInfos = permInfos;
+
     /*
      * ORCA compatibility: capture rtable during planning, use cached during
      * execution.  orca_resolve_rtable() handles both cases:
      * - During planning: captures rangeTabls, returns false
      * - During execution: returns true and the cached data on a hit
+     *
+     * The cached lists are only for auditing.
      */
     {
         List *cached_rtable = NIL;
@@ -1642,7 +1648,7 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls,
     if (orca_in_planner())
     {
         if (next_ExecutorCheckPerms_hook &&
-            !(*next_ExecutorCheckPerms_hook)(rangeTabls, permInfos,
+            !(*next_ExecutorCheckPerms_hook)(callerRangeTabls, callerPermInfos,
                                              ereport_on_violation))
             return false;
         return true;
@@ -1731,10 +1737,12 @@ pgaudit_ExecutorCheckPerms_hook(List *rangeTabls,
     }
 
     /* Call the next hook function */
+/* WHPG PATCH Starts */
     if (next_ExecutorCheckPerms_hook &&
-        !(*next_ExecutorCheckPerms_hook)(rangeTabls, permInfos,
+        !(*next_ExecutorCheckPerms_hook)(callerRangeTabls, callerPermInfos,
                                          ereport_on_violation))
         return false;
+/* WHPG PATCH Ends */
 
     return true;
 }
