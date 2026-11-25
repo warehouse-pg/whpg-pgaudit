@@ -1,5 +1,5 @@
 MODULE_big = pgaudit
-OBJS = pgaudit.o $(WIN32RES)
+OBJS = pgaudit.o pgaudit_orca.o $(WIN32RES)
 
 # The version in the control file is the source of truth
 PGAUDIT_VERSION := $(shell grep default_version $(dir $(firstword $(MAKEFILE_LIST)))pgaudit.control | sed "s/.*'\(.*\)'/\1/")
@@ -10,7 +10,9 @@ PG_CPPFLAGS = -DPGAUDIT_VERSION="\"$(PGAUDIT_VERSION)\""
 PGFILEDESC = "pgAudit - An audit logging extension for PostgreSQL"
 
 REGRESS = pgaudit
-REGRESS_OPTS = --temp-config=$(top_srcdir)/contrib/pgaudit/pgaudit.conf
+REGRESS_OPTS = --temp-config=$(top_srcdir)/contrib/pgaudit/pgaudit.conf \
+			   --init-file=./init_file \
+			   --print-failure-diffs
 
 TAP_TESTS = 1
 
