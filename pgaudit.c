@@ -1143,6 +1143,7 @@ log_select_dml(Oid auditOid, List *rangeTabls, List *permInfos)
         Oid relNamespaceOid;
         RangeTblEntry *rte = lfirst(lr);
         const RTEPermissionInfo *perminfo;
+        bool lockingSelect;     /* WHPG: SELECT FOR UPDATE, etc. */
 
         /*
          * We only care about tables/views, which have perminfoindex set. This
@@ -1214,6 +1215,19 @@ log_select_dml(Oid auditOid, List *rangeTabls, List *permInfos)
          */
         perminfo = getRTEPermissionInfo(permInfos, rte);
 
+/* WHPG PATCH Starts */
+        /*
+         * WarehousePG may upgrade the lock on a distributed table to
+         * ExclusiveLock for SELECT FOR UPDATE, etc. as it does for UPDATE, so
+         * rellockmode alone cannot identify a locking SELECT.  A locking
+         * SELECT requires ACL_UPDATE without having any column to update.
+         */
+        lockingSelect = rte->rellockmode == RowShareLock ||
+                        (rte->rellockmode == ExclusiveLock &&
+                         perminfo->requiredPerms & ACL_UPDATE &&
+                         bms_is_empty(perminfo->updatedCols));
+/* WHPG PATCH Ends */
+
         if (perminfo->requiredPerms & ACL_INSERT)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
@@ -1221,7 +1235,7 @@ log_select_dml(Oid auditOid, List *rangeTabls, List *permInfos)
             auditEventStack->auditEvent.command = CMDTAG_INSERT;
         }
         else if (perminfo->requiredPerms & ACL_UPDATE &&
-                 rte->rellockmode >= RowExclusiveLock)
+                 rte->rellockmode >= RowExclusiveLock && !lockingSelect)
         {
             auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
             auditEventStack->auditEvent.commandTag = T_UpdateStmt;
@@ -1358,7 +1372,7 @@ log_select_dml(Oid auditOid, List *rangeTabls, List *permInfos)
             /*
              * SELECT FOR UPDATE is not logged when SELECT is not granted
              */
-            if (rte->rellockmode == RowShareLock &&
+            if (lockingSelect &&
                 !audit_on_relation(relOid, auditOid, ACL_SELECT))
                 auditEventStack->auditEvent.granted =
                     audit_on_any_attribute(relOid, auditOid,
