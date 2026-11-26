@@ -1944,6 +1944,25 @@ DROP ROLE regress_schema_grant;
 DROP ROLE regress_schema_auth;
 DROP EXTENSION pgaudit;
 
+--
+-- WHPG: auditing is switched on inside a transaction, after a statement that
+-- ran with auditing off. The GPORCA layer does no work while auditing is off;
+-- once it is on, the entry must name the view and its table again.
+CREATE TABLE whpg_switch_tbl (id int);
+CREATE VIEW whpg_switch_vw AS SELECT * FROM whpg_switch_tbl;
+SET pgaudit.log_relation = on;
+
+BEGIN;
+SELECT count(*) FROM whpg_switch_vw;
+SET pgaudit.log = 'read';
+SELECT count(*) FROM whpg_switch_vw;
+COMMIT;
+
+SET pgaudit.log = 'none';
+SET pgaudit.log_relation = off;
+DROP VIEW whpg_switch_vw;
+DROP TABLE whpg_switch_tbl;
+
 -- Cleanup
 -- Set client_min_messages up to warning to avoid noise
 SET client_min_messages = 'warning';

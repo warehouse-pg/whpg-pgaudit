@@ -134,6 +134,9 @@ static MemoryContext rtable_cache_context = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_executor_start_hook = NULL;
 
+/* Set by orca_init(): can a statement be audited with the current settings? */
+static bool (*orca_audit_enabled) (void) = NULL;
+
 static MemoryContextCallback rtable_cache_callback = {
     .func = rtable_cache_reset,
     .arg = NULL,
@@ -409,9 +412,9 @@ pgaudit_orca_planner_hook(Query *parse, const char *query_string,
     PlannedStmt *result;
     ContextEntry *ctx;
 
-    if (!optimizer)
+    if (!optimizer || !orca_audit_enabled())
     {
-        /* Do nothing if it is not orca */
+        /* Do nothing if it is not orca, or if nothing can be audited */
         if (prev_planner_hook)
             result = prev_planner_hook(parse, query_string, cursorOptions,
                                        boundParams, es);
@@ -494,8 +497,10 @@ pgaudit_orca_executor_start_hook(QueryDesc *queryDesc, int eflags)
  * Initialize ORCA compatibility layer.
  */
 void
-orca_init(void)
+orca_init(bool (*audit_enabled) (void))
 {
+    orca_audit_enabled = audit_enabled;
+
     prev_planner_hook = planner_hook;
     planner_hook = pgaudit_orca_planner_hook;
 
