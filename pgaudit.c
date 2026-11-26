@@ -2396,7 +2396,7 @@ _PG_init(void)
      * after the check above: a load that fails is not remembered and may be
      * tried again, which would install the hooks a second time.
      */
-    orca_init();
+    orca_init(audit_executor_enabled);
 /* WHPG PATCH Ends */
 
     /* Define pgaudit.log */

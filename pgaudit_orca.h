@@ -13,7 +13,11 @@
 #include "postgres.h"
 #include "nodes/pg_list.h"
 
-extern void orca_init(void);
+/*
+ * Installs the hooks.  audit_enabled tells whether a statement can be audited
+ * at all with the current settings; the layer does no work while it is false.
+ */
+extern void orca_init(bool (*audit_enabled) (void));
 extern bool orca_in_planner(void);
 
 /*
